@@ -715,20 +715,28 @@ class AdvancedFeaturesTests(unittest.TestCase):
             self.assertEqual(len(items), 2)
             self.assertEqual(items[0]["user_decision"], "DEFAULT")
 
-            # 2. Set img1 to KEEP and img2 to DISCARD
-            d1 = client.post("/api/triage/decide", json={"path": str(img1), "decision": "KEEP"})
+            # 2. Set img1 to MAIN and img2 to NON_RELEVANT
+            d1 = client.post("/api/triage/decide", json={"path": str(img1), "decision": "MAIN"})
             self.assertEqual(d1.status_code, 200)
-            d2 = client.post("/api/triage/decide", json={"path": str(img2), "decision": "DISCARD"})
+            self.assertEqual(d1.json()["decision"], "MAIN")
+            d2 = client.post("/api/triage/decide", json={"path": str(img2), "decision": "NON_RELEVANT"})
             self.assertEqual(d2.status_code, 200)
+            self.assertEqual(d2.json()["decision"], "NON_RELEVANT")
 
             # Check triage query returns active decisions
             t_res2 = client.get("/api/triage")
             items2 = t_res2.json()["maybe_non_relevant"]
             decisions = {it["path"]: it["user_decision"] for it in items2}
-            self.assertEqual(decisions[str(img1)], "KEEP")
-            self.assertEqual(decisions[str(img2)], "DISCARD")
+            self.assertEqual(decisions[str(img1)], "MAIN")
+            self.assertEqual(decisions[str(img2)], "NON_RELEVANT")
 
-            # 3. Test RESET
+            # 3. Test TO_BE_DELETED
+            d3 = client.post("/api/triage/decide", json={"path": str(img2), "decision": "TO_BE_DELETED"})
+            self.assertEqual(d3.status_code, 200)
+            t_res_del = client.get("/api/triage")
+            self.assertEqual(t_res_del.json()["maybe_non_relevant"][1]["user_decision"], "TO_BE_DELETED")
+
+            # 4. Test RESET
             r_res = client.post("/api/triage/decide", json={"path": str(img2), "decision": "RESET"})
             self.assertEqual(r_res.status_code, 200)
             t_res3 = client.get("/api/triage")

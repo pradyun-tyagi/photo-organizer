@@ -246,23 +246,38 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
 
         for item in nr + maybe:
             resolved_p = str(Path(item["path"]).resolve())
-            item["user_decision"] = state.custom_triage_decisions.get(
+            dec = state.custom_triage_decisions.get(
                 item["path"],
                 state.custom_triage_decisions.get(resolved_p, "DEFAULT")
             )
+            if dec == "KEEP":
+                dec = "MAIN"
+            elif dec == "DISCARD":
+                dec = "NON_RELEVANT"
+            elif dec == "DELETE":
+                dec = "TO_BE_DELETED"
+            item["user_decision"] = dec
 
         return {"non_relevant": nr, "maybe_non_relevant": maybe}
 
     @app.post("/api/triage/decide")
     def triage_decide(req: TriageDecisionRequest):
         resolved = str(Path(req.path).resolve())
-        if req.decision == "RESET":
+        dec = req.decision.upper()
+        if dec == "KEEP":
+            dec = "MAIN"
+        elif dec == "DISCARD":
+            dec = "NON_RELEVANT"
+        elif dec == "DELETE":
+            dec = "TO_BE_DELETED"
+
+        if dec == "RESET":
             state.custom_triage_decisions.pop(req.path, None)
             state.custom_triage_decisions.pop(resolved, None)
         else:
-            state.custom_triage_decisions[req.path] = req.decision
-            state.custom_triage_decisions[resolved] = req.decision
-        return {"status": "ok", "decision": req.decision}
+            state.custom_triage_decisions[req.path] = dec
+            state.custom_triage_decisions[resolved] = dec
+        return {"status": "ok", "decision": dec}
 
     def _run_organize_task(req: ExecuteRequest):
         def _on_progress(stage: str, percent: float, details: dict):
@@ -951,12 +966,19 @@ def get_dashboard_html() -> str:
             </p>
           </div>
         </div>
-        <div class="flex items-center gap-2 self-stretch md:self-auto shrink-0">
-          <button onclick="applyAllTriage('KEEP')" class="flex-1 md:flex-none px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-colors shadow-xs">
-            Keep All as Photos
+        <div class="flex flex-wrap items-center gap-1.5 self-stretch md:self-auto shrink-0 text-xs">
+          <span class="text-slate-400 text-[11px] font-semibold mr-1">Move All To:</span>
+          <button onclick="applyAllTriage('MAIN')" class="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-semibold border border-emerald-200 transition-colors shadow-xs">
+            📸 Main Photo
           </button>
-          <button onclick="applyAllTriage('DISCARD')" class="flex-1 md:flex-none px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 transition-colors shadow-xs">
-            Move All to Junk
+          <button onclick="applyAllTriage('MAYBE')" class="px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 font-semibold border border-amber-200 transition-colors shadow-xs">
+            ❓ Maybe
+          </button>
+          <button onclick="applyAllTriage('NON_RELEVANT')" class="px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-800 font-semibold border border-rose-200 transition-colors shadow-xs">
+            🗑️ Junk
+          </button>
+          <button onclick="applyAllTriage('TO_BE_DELETED')" class="px-2.5 py-1.5 rounded-lg bg-purple-50 hover:bg-purple-100 text-purple-800 font-semibold border border-purple-200 transition-colors shadow-xs">
+            ❌ Delete
           </button>
         </div>
       </div>
@@ -1521,46 +1543,68 @@ def get_dashboard_html() -> str:
     function renderTriageCardContent(card, item) {
       const isMaybe = item.type === 'Maybe Non-relevant';
       const tagClass = isMaybe ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800';
-      const decision = item.user_decision || 'DEFAULT';
+      let decision = item.user_decision || 'DEFAULT';
+      if (decision === 'KEEP') decision = 'MAIN';
+      if (decision === 'DISCARD') decision = 'NON_RELEVANT';
+      if (decision === 'DELETE') decision = 'TO_BE_DELETED';
 
       let decisionBadge = '';
-      let keepBtnClass = 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold';
-      let keepBtnText = 'Keep as Photo';
-      let junkBtnClass = 'bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold';
-      let junkBtnText = 'Move to Junk';
+      let borderClass = 'border-slate-200 bg-white';
 
-      if (decision === 'KEEP') {
-        card.className = "bg-emerald-50/40 border-2 border-emerald-400 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
-        keepBtnClass = 'bg-emerald-600 text-white font-bold shadow-xs';
-        keepBtnText = '✓ Kept as Photo';
-        junkBtnClass = 'bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs';
-        junkBtnText = 'Move to Junk';
+      const btnMain = decision === 'MAIN'
+        ? 'bg-emerald-600 text-white font-bold shadow-xs'
+        : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800';
+      const btnMaybe = decision === 'MAYBE'
+        ? 'bg-amber-500 text-white font-bold shadow-xs'
+        : 'bg-amber-50 hover:bg-amber-100 text-amber-800';
+      const btnJunk = decision === 'NON_RELEVANT'
+        ? 'bg-rose-600 text-white font-bold shadow-xs'
+        : 'bg-rose-50 hover:bg-rose-100 text-rose-800';
+      const btnDelete = decision === 'TO_BE_DELETED'
+        ? 'bg-purple-600 text-white font-bold shadow-xs'
+        : 'bg-purple-50 hover:bg-purple-100 text-purple-800';
+
+      if (decision === 'MAIN') {
+        borderClass = 'border-2 border-emerald-400 bg-emerald-50/30';
         decisionBadge = `
-          <div class="px-2.5 py-1 bg-emerald-100/80 border border-emerald-300 text-emerald-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
-            <span class="flex items-center gap-1">✓ <span>Will keep in library (<span class="font-mono">YYYY/YYYY-MM</span>)</span></span>
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-emerald-700 hover:text-emerald-950 underline text-[10px] ml-2">Reset</button>
+          <div class="px-2 py-1 bg-emerald-100/90 border border-emerald-300 text-emerald-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span>📸 Destination: <strong>Main Library</strong> (<span class="font-mono text-[10px]">YYYY/YYYY-MM/</span>)</span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-emerald-700 hover:text-emerald-950 underline text-[10px] ml-1.5">Reset</button>
           </div>
         `;
-      } else if (decision === 'DISCARD') {
-        card.className = "bg-rose-50/40 border-2 border-rose-400 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
-        junkBtnClass = 'bg-rose-600 text-white font-bold shadow-xs';
-        junkBtnText = '✓ Marked as Junk';
-        keepBtnClass = 'bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs';
-        keepBtnText = 'Keep as Photo';
+      } else if (decision === 'MAYBE') {
+        borderClass = 'border-2 border-amber-400 bg-amber-50/30';
         decisionBadge = `
-          <div class="px-2.5 py-1 bg-rose-100/80 border border-rose-300 text-rose-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
-            <span class="flex items-center gap-1">🗑️ <span>Will move to <span class="font-mono">non-relevant/</span></span></span>
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-rose-700 hover:text-rose-950 underline text-[10px] ml-2">Reset</button>
+          <div class="px-2 py-1 bg-amber-100/90 border border-amber-300 text-amber-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span>❓ Destination: <strong>maybe-non-relevant/</strong></span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-amber-700 hover:text-amber-950 underline text-[10px] ml-1.5">Reset</button>
+          </div>
+        `;
+      } else if (decision === 'NON_RELEVANT') {
+        borderClass = 'border-2 border-rose-400 bg-rose-50/30';
+        decisionBadge = `
+          <div class="px-2 py-1 bg-rose-100/90 border border-rose-300 text-rose-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span>🗑️ Destination: <strong>non-relevant/</strong> (Junk)</span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-rose-700 hover:text-rose-950 underline text-[10px] ml-1.5">Reset</button>
+          </div>
+        `;
+      } else if (decision === 'TO_BE_DELETED') {
+        borderClass = 'border-2 border-purple-400 bg-purple-50/30';
+        decisionBadge = `
+          <div class="px-2 py-1 bg-purple-100/90 border border-purple-300 text-purple-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span>❌ Destination: <strong>to-be-deleted/</strong></span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-purple-700 hover:text-purple-950 underline text-[10px] ml-1.5">Reset</button>
           </div>
         `;
       } else {
-        card.className = "bg-white border border-slate-200 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
         decisionBadge = `
-          <div class="px-2.5 py-1 bg-slate-50 border border-slate-200 text-slate-500 rounded-lg text-[11px] italic">
+          <div class="px-2 py-1 bg-slate-50 border border-slate-200 text-slate-500 rounded-lg text-[10px] italic">
             Default on organize: ${isMaybe ? 'Quarantine to maybe-non-relevant/' : 'Move to non-relevant/ junk'}
           </div>
         `;
       }
+
+      card.className = `${borderClass} rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2.5 transition-all`;
 
       card.innerHTML = `
         <div class="relative aspect-video rounded-lg overflow-hidden bg-slate-100">
@@ -1577,12 +1621,18 @@ def get_dashboard_html() -> str:
           <p class="text-[11px] text-slate-500 leading-tight">${item.reason}</p>
         </div>
         <div class="space-y-1.5 pt-1">
-          <div class="flex gap-1.5">
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'KEEP')" class="flex-1 py-1.5 text-xs rounded-lg ${keepBtnClass} transition-colors">
-              ${keepBtnText}
+          <div class="grid grid-cols-4 gap-1">
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'MAIN')" title="Keep as real photo in main library" class="py-1.5 text-[11px] rounded-lg ${btnMain} font-semibold transition-colors flex items-center justify-center gap-0.5">
+              <span>📸</span> <span>Main</span>
             </button>
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'DISCARD')" class="flex-1 py-1.5 text-xs rounded-lg ${junkBtnClass} transition-colors">
-              ${junkBtnText}
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'MAYBE')" title="Move to maybe-non-relevant review folder" class="py-1.5 text-[11px] rounded-lg ${btnMaybe} font-semibold transition-colors flex items-center justify-center gap-0.5">
+              <span>❓</span> <span>Maybe</span>
+            </button>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'NON_RELEVANT')" title="Move to non-relevant junk folder" class="py-1.5 text-[11px] rounded-lg ${btnJunk} font-semibold transition-colors flex items-center justify-center gap-0.5">
+              <span>🗑️</span> <span>Junk</span>
+            </button>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'TO_BE_DELETED')" title="Move to to-be-deleted folder" class="py-1.5 text-[11px] rounded-lg ${btnDelete} font-semibold transition-colors flex items-center justify-center gap-0.5">
+              <span>❌</span> <span>Delete</span>
             </button>
           </div>
           ${decisionBadge}

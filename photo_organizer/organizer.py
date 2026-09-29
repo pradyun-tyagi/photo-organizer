@@ -420,8 +420,11 @@ def organize(
         for p in photos:
             p_str = str(p.path)
             p_res = str(p.path.resolve())
-            if custom_triage_decisions.get(p_str) == "DELETE" or custom_triage_decisions.get(p_res) == "DELETE":
+            dec = custom_triage_decisions.get(p_str) or custom_triage_decisions.get(p_res)
+            if dec in ("DELETE", "TO_BE_DELETED"):
                 duplicate_path_set.add(p.path)
+            elif dec in ("MAIN", "KEEP"):
+                duplicate_path_set.discard(p.path)
 
     # 1. Move duplicates into to-be-deleted
     for photo in photos:
@@ -488,12 +491,29 @@ def organize(
                 resolved_str = str(photo.path.resolve())
                 if custom_triage_decisions:
                     decision = custom_triage_decisions.get(path_str) or custom_triage_decisions.get(resolved_str)
-                    if decision == "KEEP":
+                    if decision in ("MAIN", "KEEP"):
                         relevant_photos.append(photo)
                         continue
-                    elif decision == "DISCARD":
+                    elif decision in ("NON_RELEVANT", "DISCARD"):
                         result.is_non_relevant = True
                         result.is_maybe_non_relevant = False
+                    elif decision == "MAYBE":
+                        result.is_maybe_non_relevant = True
+                        result.is_non_relevant = False
+                    elif decision in ("TO_BE_DELETED", "DELETE"):
+                        destination = destination_for_photo(to_delete_dir, photo, video_folder_name=video_folder_name)
+                        companions = [c for c in photo.companion_files if not is_video_file(c)] if is_image_file(photo.path) else photo.companion_files
+                        try:
+                            moved, dest_final, companions_moved = move_file_with_companions(
+                                photo.path, destination, companions, dry_run, journal=journal, run_id=run_id
+                            )
+                            if moved:
+                                summary.duplicates_moved += 1
+                                summary.companions_moved += companions_moved
+                                summary.moved_paths_map[str(photo.path.resolve())] = str(dest_final.resolve())
+                        except OSError as exc:
+                            summary.warnings += 1
+                        continue
 
                 if not result.is_non_relevant and not result.is_maybe_non_relevant:
                     relevant_photos.append(photo)
