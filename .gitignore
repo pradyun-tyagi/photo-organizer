@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+.pycache-check/
+*.pyc
+*.pyo
+*.pyd
+
+# Journal & Caches
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.db
+*.db-journal
+.photo_organizer_journal.db
+.photo_cache.sqlite
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration & secrets
+.env
+.env.local
+secrets/
+
+# Distribution
+dist/
+build/
+*.egg-info/
