@@ -18,6 +18,7 @@ except ImportError:
     Image = None
     ImageOps = None
 
+from photo_organizer.core.cache import PhotoCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_inside
 from photo_organizer.core.exif_writer import backfill_library_exif_dates
 from photo_organizer.core.journal import Journal
@@ -125,7 +126,6 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
         if not target.exists() or not target.is_dir():
             raise HTTPException(status_code=400, detail="Target path is not a valid directory.")
         state.root_dir = target
-        state.scan_data = None
         state.custom_keeper_map.clear()
         state.custom_triage_decisions.clear()
         state.scan_progress = {"stage": "idle", "percent": 0.0, "details": {}}
@@ -140,10 +140,38 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             ],
             include_videos=True,
         )
+
+        # Re-hydrate previously saved state from PhotoCache if available
+        cache = PhotoCache(root_dir=target)
+        cached_state = cache.load_studio_state()
+        if cached_state:
+            state.scan_data = cached_state
+            if cached_state.get("custom_people_names"):
+                state.custom_people_names.update(cached_state["custom_people_names"])
+            if cached_state.get("last_summary"):
+                state.last_summary = cached_state["last_summary"]
+        else:
+            state.scan_data = None
+
+        journal = Journal(root_dir=target)
+        journal_runs = journal.list_runs(limit=10)
+
+        people_count = len(state.scan_data.get("people_albums", [])) if state.scan_data else 0
+        flashback_count = len(state.scan_data.get("flashbacks", [])) if state.scan_data else 0
+        geo_count = len(state.scan_data.get("geo_photos", [])) if state.scan_data else 0
+        burst_count = len(state.scan_data.get("burst_groups", [])) if state.scan_data else 0
+
         return {
             "status": "ok",
             "root_dir": str(state.root_dir),
             "file_count": len(image_paths),
+            "has_cached_state": cached_state is not None,
+            "people_count": people_count,
+            "flashback_count": flashback_count,
+            "geo_count": geo_count,
+            "burst_count": burst_count,
+            "history_count": len(journal_runs),
+            "journal_runs": journal_runs,
         }
 
     def _run_scan_task(root: Path, req: ScanRequest):
@@ -235,6 +263,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
         try:
             state.is_organizing = True
             workers = req.workers if req.workers > 0 else get_default_workers()
+            journal = Journal(root_dir=state.root_dir)
             summary = organize(
                 root=state.root_dir,
                 dry_run=req.dry_run,
@@ -247,13 +276,45 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 enhancement_mode=req.enhancement_mode,
                 worker_count=workers,
                 enable_cache=True,
+                journal=journal,
                 progress_callback=_on_progress,
                 custom_keeper_map=state.custom_keeper_map,
                 custom_triage_decisions=state.custom_triage_decisions,
             )
             state.last_summary = summary.__dict__
+            
+            # Maintain and update People, Flashbacks, and Map data with new file paths
             if not req.dry_run:
-                state.scan_data = None
+                moved_map = summary.moved_paths_map
+                if state.scan_data:
+                    if moved_map:
+                        for pa in state.scan_data.get("people_albums", []):
+                            pa["photo_paths"] = [
+                                moved_map.get(str(Path(p).resolve()), p)
+                                for p in pa.get("photo_paths", [])
+                            ]
+                        for fb in state.scan_data.get("flashbacks", []):
+                            for item in fb.get("photos", []):
+                                if "path" in item:
+                                    item["path"] = moved_map.get(str(Path(item["path"]).resolve()), item["path"])
+                        for gp in state.scan_data.get("geo_photos", []):
+                            if "path" in gp:
+                                gp["path"] = moved_map.get(str(Path(gp["path"]).resolve()), gp["path"])
+
+                    # Clear only the resolved runtime curation queues
+                    state.scan_data["duplicate_clusters"] = []
+                    state.scan_data["non_relevant_items"] = []
+                    state.scan_data["maybe_non_relevant_items"] = []
+                    state.custom_keeper_map.clear()
+                    state.custom_triage_decisions.clear()
+
+                    cache = PhotoCache(root_dir=state.root_dir)
+                    cache.save_studio_state(state.scan_data)
+                else:
+                    cache = PhotoCache(root_dir=state.root_dir)
+                    loaded = cache.load_studio_state()
+                    if loaded:
+                        state.scan_data = loaded
         except Exception as exc:
             _on_progress(f"Organize error: {exc}", 0.0, {"error": str(exc)})
         finally:
@@ -557,35 +618,35 @@ def get_dashboard_html() -> str:
           <span class="text-[11px] font-medium text-slate-400">files</span>
         </div>
       </div>
-      <div class="bg-white rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between">
+      <div onclick="switchTab('tab-duplicates')" class="bg-white hover:bg-indigo-50/40 cursor-pointer rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between transition-colors">
         <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Duplicates</span>
         <div class="mt-1 flex items-baseline justify-between">
           <span id="kpi-duplicate-clusters" class="text-xl font-bold text-indigo-600">0</span>
           <span class="text-[11px] font-medium text-slate-400">clusters</span>
         </div>
       </div>
-      <div class="bg-white rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between">
+      <div onclick="switchTab('tab-triage')" class="bg-white hover:bg-amber-50/40 cursor-pointer rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between transition-colors">
         <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Triage Junk</span>
         <div class="mt-1 flex items-baseline justify-between">
           <span id="kpi-triage-items" class="text-xl font-bold text-amber-600">0</span>
           <span class="text-[11px] font-medium text-slate-400">forwards</span>
         </div>
       </div>
-      <div class="bg-white rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between">
+      <div onclick="switchTab('tab-map')" class="bg-white hover:bg-blue-50/40 cursor-pointer rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between transition-colors">
         <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Map Pins</span>
         <div class="mt-1 flex items-baseline justify-between">
           <span id="kpi-geo-photos" class="text-xl font-bold text-blue-600">0</span>
           <span class="text-[11px] font-medium text-slate-400">places</span>
         </div>
       </div>
-      <div class="bg-white rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between">
+      <div onclick="switchTab('tab-bursts')" class="bg-white hover:bg-emerald-50/40 cursor-pointer rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between transition-colors">
         <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Burst Shots</span>
         <div class="mt-1 flex items-baseline justify-between">
           <span id="kpi-burst-groups" class="text-xl font-bold text-emerald-600">0</span>
           <span class="text-[11px] font-medium text-slate-400">bursts</span>
         </div>
       </div>
-      <div class="bg-white rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between">
+      <div onclick="switchTab('tab-people')" class="bg-white hover:bg-purple-50/40 cursor-pointer rounded-xl border border-slate-200 p-3.5 flex flex-col justify-between transition-colors">
         <span class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">People</span>
         <div class="mt-1 flex items-baseline justify-between">
           <span id="kpi-people-count" class="text-xl font-bold text-purple-600">0</span>
@@ -594,40 +655,66 @@ def get_dashboard_html() -> str:
       </div>
     </div>
 
-    <!-- Navigation Tabs -->
-    <div class="border-b border-slate-200 flex flex-wrap gap-y-2 space-x-1 sm:space-x-3">
+    <!-- Main Studio Mode Switcher: Curate vs Explore -->
+    <div class="bg-white rounded-2xl border border-slate-200 p-2 shadow-xs mt-2">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="inline-flex p-1 bg-slate-100 rounded-xl space-x-1">
+          <button id="btn-section-curate" onclick="switchStudioSection('curate')" class="px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2">
+            <span>⚡ Curate & Organize</span>
+            <span class="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700">Actions</span>
+          </button>
+          <button id="btn-section-explore" onclick="switchStudioSection('explore')" class="px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2">
+            <span>🧭 Explore & View</span>
+            <span class="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-slate-200 text-slate-700">Library</span>
+          </button>
+        </div>
+        <div class="text-xs text-slate-500 px-2 flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+          <span id="section-description">Curation Studio: Resolve duplicates, screen forwards, and execute organization</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-NAVIGATION 1: Curate & Organize Tabs (Runtime actions) -->
+    <div id="nav-group-curate" class="border-b border-slate-200 flex flex-wrap gap-y-2 space-x-1 sm:space-x-3">
       <button onclick="switchTab('tab-options')" id="nav-options" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-indigo-600 text-indigo-600 flex items-center gap-1.5">
-        <span>⚙️ Options</span>
+        <span>⚙️ Options & EXIF</span>
       </button>
       <button onclick="switchTab('tab-duplicates')" id="nav-duplicates" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
         <span>🖼️ Duplicates</span>
         <span id="count-duplicates" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
       </button>
       <button onclick="switchTab('tab-triage')" id="nav-triage" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>📑 Triage</span>
+        <span>📑 Triage Queue</span>
         <span id="count-triage" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
+      </button>
+      <button onclick="switchTab('tab-bursts')" id="nav-bursts" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
+        <span>⚡ Burst Shots</span>
+        <span id="count-bursts" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
+      </button>
+    </div>
+
+    <!-- SUB-NAVIGATION 2: Explore & View Tabs (Query & Browsing) -->
+    <div id="nav-group-explore" class="hidden border-b border-slate-200 flex flex-wrap gap-y-2 space-x-1 sm:space-x-3">
+      <button onclick="switchTab('tab-people')" id="nav-people" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
+        <span>👥 People Albums</span>
+        <span id="count-people" class="bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded-full font-mono font-bold">0</span>
+      </button>
+      <button onclick="switchTab('tab-flashbacks')" id="nav-flashbacks" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
+        <span>✨ Flashbacks</span>
+        <span id="count-flashbacks" class="bg-amber-100 text-amber-700 text-xs px-2 py-0.5 rounded-full font-mono font-bold">0</span>
+      </button>
+      <button onclick="switchTab('tab-map')" id="nav-map" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
+        <span>🗺️ World Map</span>
+        <span id="count-map" class="bg-emerald-100 text-emerald-700 text-xs px-2 py-0.5 rounded-full font-mono font-bold">0</span>
       </button>
       <button onclick="switchTab('tab-search')" id="nav-search" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
         <span>🔍 AI Search</span>
         <span id="count-search" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
       </button>
-      <button onclick="switchTab('tab-map')" id="nav-map" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>🗺️ World Map</span>
-        <span id="count-map" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
-      </button>
-      <button onclick="switchTab('tab-bursts')" id="nav-bursts" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>⚡ Bursts</span>
-        <span id="count-bursts" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
-      </button>
-      <button onclick="switchTab('tab-people')" id="nav-people" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>👥 People</span>
-        <span id="count-people" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
-      </button>
-      <button onclick="switchTab('tab-flashbacks')" id="nav-flashbacks" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>✨ Flashbacks</span>
-      </button>
       <button onclick="switchTab('tab-history')" id="nav-history" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
-        <span>📜 History</span>
+        <span>📜 History & Rollback</span>
+        <span id="count-history" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
       </button>
     </div>
 
@@ -1160,15 +1247,40 @@ def get_dashboard_html() -> str:
         const progressBar = document.getElementById('progress-bar');
 
         progressContainer.classList.remove('hidden');
-        progressStage.innerHTML = `Folder set: ${data.file_count.toLocaleString()} media files found. Click "🔍 Scan & Analyze" to begin.`;
         progressPercent.textContent = "Ready";
         progressBar.style.width = "0%";
+
+        if (data.has_cached_state || data.history_count > 0) {
+          // Pre-populate viewing metrics from previously executed scan or organize
+          document.getElementById('kpi-people-count').textContent = data.people_count || 0;
+          document.getElementById('kpi-geo-photos').textContent = data.geo_count || 0;
+          document.getElementById('kpi-burst-groups').textContent = data.burst_count || 0;
+          if (document.getElementById('count-people')) document.getElementById('count-people').textContent = data.people_count || 0;
+          if (document.getElementById('count-map')) document.getElementById('count-map').textContent = data.geo_count || 0;
+          if (document.getElementById('count-flashbacks')) document.getElementById('count-flashbacks').textContent = data.flashback_count || 0;
+          if (document.getElementById('count-history')) document.getElementById('count-history').textContent = data.history_count || 0;
+          
+          await fetchStatus();
+          await loadPeople();
+          await loadFlashbacks();
+          await fetchMapPins();
+
+          progressStage.innerHTML = `Loaded previous library state: <b>${data.people_count}</b> People albums, <b>${data.flashback_count}</b> Flashback memories, <b>${data.geo_count}</b> Map pins ready.`;
+          
+          // If library has previously organized/scanned data, switch to Explore view immediately
+          if (data.people_count > 0 || data.flashback_count > 0 || data.history_count > 0) {
+            switchStudioSection('explore');
+          }
+        } else {
+          progressStage.innerHTML = `Folder set: ${data.file_count.toLocaleString()} media files found. Click "🔍 Scan & Analyze" to begin.`;
+        }
       } else {
         alert("Invalid directory path. Please check the path and try again.");
       }
     }
 
     async function startScan() {
+      switchStudioSection('curate');
       const payload = {
         include_videos: document.getElementById('cfg-include-videos').checked,
         video_folder: "video",
@@ -1463,9 +1575,64 @@ def get_dashboard_html() -> str:
       loadScanResults();
     }
 
+    let currentSection = 'curate';
+    let currentCurateTab = 'tab-options';
+    let currentExploreTab = 'tab-people';
+
+    function switchStudioSection(section) {
+      currentSection = section;
+      const btnCurate = document.getElementById('btn-section-curate');
+      const btnExplore = document.getElementById('btn-section-explore');
+      const navCurate = document.getElementById('nav-group-curate');
+      const navExplore = document.getElementById('nav-group-explore');
+      const desc = document.getElementById('section-description');
+
+      if (section === 'curate') {
+        btnCurate.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2';
+        btnExplore.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
+        navCurate.classList.remove('hidden');
+        navExplore.classList.add('hidden');
+        desc.textContent = 'Curation Studio: Resolve duplicates, screen forwards, and execute organization';
+        switchTab(currentCurateTab);
+      } else {
+        btnExplore.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2';
+        btnCurate.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
+        navExplore.classList.remove('hidden');
+        navCurate.classList.add('hidden');
+        desc.textContent = 'Library Explorer: Query people, relive flashbacks, browse world map, and view rollback history';
+        switchTab(currentExploreTab);
+      }
+    }
+
     function switchTab(tabId) {
+      const curateTabs = ['tab-options', 'tab-duplicates', 'tab-triage', 'tab-bursts'];
+      const exploreTabs = ['tab-people', 'tab-flashbacks', 'tab-map', 'tab-search', 'tab-history'];
+
+      if (curateTabs.includes(tabId)) {
+        currentCurateTab = tabId;
+        if (currentSection !== 'curate') {
+          currentSection = 'curate';
+          document.getElementById('btn-section-curate').className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2';
+          document.getElementById('btn-section-explore').className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
+          document.getElementById('nav-group-curate').classList.remove('hidden');
+          document.getElementById('nav-group-explore').classList.add('hidden');
+          document.getElementById('section-description').textContent = 'Curation Studio: Resolve duplicates, screen forwards, and execute organization';
+        }
+      } else if (exploreTabs.includes(tabId)) {
+        currentExploreTab = tabId;
+        if (currentSection !== 'explore') {
+          currentSection = 'explore';
+          document.getElementById('btn-section-explore').className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2';
+          document.getElementById('btn-section-curate').className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
+          document.getElementById('nav-group-explore').classList.remove('hidden');
+          document.getElementById('nav-group-curate').classList.add('hidden');
+          document.getElementById('section-description').textContent = 'Library Explorer: Query people, relive flashbacks, browse world map, and view rollback history';
+        }
+      }
+
       document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-      document.getElementById(tabId).classList.remove('hidden');
+      const activeContent = document.getElementById(tabId);
+      if (activeContent) activeContent.classList.remove('hidden');
 
       document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.classList.remove('border-indigo-600', 'text-indigo-600');
@@ -1965,7 +2132,12 @@ def get_dashboard_html() -> str:
           const sData = await sRes.json();
           if (!sData.is_scanning && !sData.is_organizing) {
             clearInterval(pollInterval);
-            loadScanResults();
+            await loadScanResults();
+            await fetchStatus();
+            await loadPeople();
+            await loadFlashbacks();
+            await fetchMapPins();
+            switchStudioSection('explore');
           }
         }, 500);
       }

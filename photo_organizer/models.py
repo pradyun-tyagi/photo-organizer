@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -88,6 +88,7 @@ class ActionSummary:
     empty_dirs_removed: int = 0
     companions_moved: int = 0
     warnings: int = 0
+    moved_paths_map: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -204,14 +204,18 @@ Enables natural language discovery without cloud AI models:
 
 ### 4.6. Face Clustering & "People Albums" (`vision/faces.py`)
 
-1. **Face Detection**:
-   - Uses OpenCV's Haar Feature-based Cascade Classifier (`haarcascade_frontalface_default.xml`).
-   - Filters out false positives below minimum bounding box dimensions ($48 \times 48$).
-2. **Spatial Color & Feature Vector**:
-   - Extracts cropped face region, converts to HSV color space, and computes normalized spatial color histograms.
-3. **Incremental Clustering**:
-   - Matches faces against existing clusters using Bhattacharyya distance / histogram correlation.
-   - Dynamic thresholding groups consistent identities into individual person albums with auto-generated face crop avatars.
+1. **Neural Face Detection (YuNet)**:
+   - Uses OpenCV's deep learning `FaceDetectorYN` (YuNet) running offline on CPU.
+   - Accurately detects faces with 5 facial landmarks (eyes, nose, mouth corners) while eliminating false positives from cluttered backgrounds or patterns.
+2. **Deep Biometric Feature Embeddings (SFace)**:
+   - Uses OpenCV's deep learning `FaceRecognizerSF` (SFace).
+   - Aligns the cropped face using the 5 detected landmarks (`recognizer.alignCrop`) and projects it into a **128-dimensional metric feature space** (`recognizer.feature`).
+   - The resulting vector is $L_2$-normalized to the unit sphere: $\|f\|_2 = 1.0$.
+3. **Metric Cosine Distance Clustering**:
+   - Faces are matched using vector cosine similarity:
+     $$\text{CosineSimilarity}(f_1, f_2) = f_1 \cdot f_2$$
+   - A threshold of $\ge 0.48$ groups genuine matching facial identities together, completely invariant to skin tone, room lighting, hair color, or background changes.
+   - Padded portrait crops are encoded into base64 thumbnails for instantaneous UI display.
 4. **Web UI Customization**:
    - Enables inline renaming (e.g. `"Person 1"` $\rightarrow$ `"Alice"`).
 

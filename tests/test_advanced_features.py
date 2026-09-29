@@ -570,6 +570,95 @@ class AdvancedFeaturesTests(unittest.TestCase):
             self.assertEqual(res_rename.status_code, 200)
             self.assertEqual(res_rename.json()["name"], "Sarah")
 
+    def test_studio_state_persistence_and_rehydration(self):
+        """Verifies that studio state (People, Flashbacks, etc.) persists and re-hydrates upon set-directory."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            img1 = root / "IMG_20240101_100000.jpg"
+            img1.write_bytes(b"\xFF\xD8\xFF\xE0" + b"\x00" * 200)
+
+            cache = PhotoCache(root_dir=root)
+            mock_state = {
+                "people_albums": [
+                    {"person_id": "p1", "name": "Alice", "face_count": 5, "photo_paths": [str(img1)]}
+                ],
+                "flashbacks": [
+                    {"anniversary_label": "1 Year Ago", "photos": [{"path": str(img1), "year": 2024}]}
+                ],
+                "geo_photos": [{"path": str(img1), "latitude": 40.7128, "longitude": -74.0060}],
+            }
+            cache.save_studio_state(mock_state)
+
+            # Test cache loading directly
+            loaded = cache.load_studio_state()
+            self.assertIsNotNone(loaded)
+            self.assertEqual(len(loaded["people_albums"]), 1)
+            self.assertEqual(loaded["people_albums"][0]["name"], "Alice")
+
+            # Test web API set-directory re-hydrating it immediately
+            app = create_app(default_root=root)
+            client = TestClient(app)
+            res = client.post("/api/set-directory", json={"directory": str(root)})
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertTrue(data.get("has_cached_state"))
+            self.assertEqual(data.get("people_count"), 1)
+            self.assertEqual(data.get("flashback_count"), 1)
+
+            # Confirm /api/people and /api/flashbacks return the re-hydrated data without scanning
+            people_res = client.get("/api/people")
+            self.assertEqual(people_res.status_code, 200)
+            self.assertEqual(len(people_res.json()["people"]), 1)
+            self.assertEqual(people_res.json()["people"][0]["name"], "Alice")
+
+            flash_res = client.get("/api/flashbacks")
+            self.assertEqual(flash_res.status_code, 200)
+            self.assertEqual(len(flash_res.json()["flashbacks"]), 1)
+
+    def test_deep_face_embeddings_and_cosine_clustering(self):
+        """Verifies that face recognition models load and cluster embeddings using cosine distance."""
+        from photo_organizer.vision.faces import _get_deep_face_models, cluster_people_albums
+        det, rec = _get_deep_face_models()
+        self.assertIsNotNone(det)
+        self.assertIsNotNone(rec)
+
+        # Test clustering logic with distinct embeddings
+        import numpy as np
+        f_alice_1 = np.zeros(128, dtype=np.float32)
+        f_alice_1[0] = 1.0  # Unit vector along axis 0
+        f_alice_2 = np.zeros(128, dtype=np.float32)
+        f_alice_2[0] = 0.95
+        f_alice_2[1] = 0.312  # Cosine similarity ~ 0.95
+
+        f_bob = np.zeros(128, dtype=np.float32)
+        f_bob[10] = 1.0  # Orthogonal vector, cosine similarity = 0.0
+
+        p1 = PhotoInfo(path=Path("alice_1.jpg"), taken_at=datetime(2024, 1, 1))
+        p2 = PhotoInfo(path=Path("alice_2.jpg"), taken_at=datetime(2024, 1, 2))
+        p3 = PhotoInfo(path=Path("bob.jpg"), taken_at=datetime(2024, 1, 3))
+
+        face_records = [
+            (p1, f_alice_1, "thumb1"),
+            (p2, f_alice_2, "thumb2"),
+            (p3, f_bob, "thumb3"),
+        ]
+
+        # Mock extract_face_crops_and_features to test clustering algorithm
+        import photo_organizer.vision.faces as face_module
+        orig_extract = face_module.extract_face_crops_and_features
+        face_module.extract_face_crops_and_features = lambda p: [
+            ((0, 0, 50, 50), f_alice_1 if "alice_1" in str(p.path) else (f_alice_2 if "alice_2" in str(p.path) else f_bob), "thumb")
+        ]
+        try:
+            clusters = cluster_people_albums([p1, p2, p3], similarity_threshold=0.48)
+            # Must produce exactly 2 distinct people clusters: Alice and Bob
+            self.assertEqual(len(clusters), 2)
+            # Largest cluster should have Alice's 2 photos
+            self.assertEqual(clusters[0].face_count, 2)
+            self.assertEqual(clusters[1].face_count, 1)
+        finally:
+            face_module.extract_face_crops_and_features = orig_extract
+
 
 if __name__ == "__main__":
     unittest.main()

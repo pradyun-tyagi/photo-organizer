@@ -91,53 +91,51 @@ The transaction journal will restore all files and directory structures back to 
 
 ## 3. Web UI Studio Walkthrough
 
-When you open `http://127.0.0.1:8080`, the interface presents 9 specialized tabs:
+When you open `http://127.0.0.1:8080`, the interface cleanly separates **Runtime Organization Actions** from **Library Query & Viewing**:
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Photo Organizer Studio                                                │
 │  Target: [/path/to/photos            ] [ Set Folder ] [ Scan Library ] │
 ├────────────────────────────────────────────────────────────────────────┤
-│  [KPI: Total] [Duplicates] [Triage] [Bursts] [People] [Geotagged]      │
+│  [KPI: Total] [Duplicates] [Triage] [Map Pins] [Bursts] [People]       │
 ├────────────────────────────────────────────────────────────────────────┤
-│  [Options] [Duplicates] [Triage] [AI Search] [World Map]               │
-│  [Burst Shots] [People Albums] [Flashbacks] [History]                  │
+│  [ ⚡ Curate & Organize (Actions) ]   [ 🧭 Explore & View (Library) ]  │
+│  ┌─────────────────────────────────┐   ┌─────────────────────────────┐ │
+│  │ ⚙️ Options & EXIF               │   │ 👥 People Albums (SFace)    │ │
+│  │ 🖼️ Duplicates (Interactive)     │   │ ✨ Flashbacks (Memories)    │ │
+│  │ 📑 Triage Queue (Memes/Junk)    │   │ 🗺️ World Map (GPS Clusters) │ │
+│  │ ⚡ Burst Shots (Best Selector)  │   │ 🔍 AI Semantic Search       │ │
+│  └─────────────────────────────────┘   │ 📜 History & Rollback (Undo)│ │
+│                                        └─────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.1 Initial Scan & Folder Selection
 1. Enter the absolute path to your photo library in the top bar (e.g. `C:\path\to\photos` or `/path/to/photos`).
-2. Click **Set Folder**. The server will index the directory structure.
-3. Click **Scan Library**. The system analyzes all images, extracts EXIF/container dates, generates perceptual hashes, and runs face/burst detection.
+2. Click **Set Folder**.
+   - If the folder was previously scanned or organized, the Studio **immediately re-hydrates** your People albums, Flashbacks, World Map, and History from the persistent cache without requiring a re-scan!
+   - You can jump directly to the **Explore & View** section to browse your collection.
+3. Click **Scan & Analyze** to execute a full fresh scan of any incoming photos, identify new duplicates, screen text forwards, detect rapid bursts, and run neural face clustering.
 
 ---
 
-### 3.2 Tab 1: Options & Scan Controls
-- **Dry-Run Mode**: Toggle on to simulate organization without writing changes to disk.
-- **Visual Threshold**: Adjust perceptual sensitivity ($0$ to $64$, default $5$). Lower values require near-identical pixels; higher values detect crops and edits.
-- **Worker Threads**: Control parallelism ($1$ to $8$ threads). Defaults to host CPU count.
-- **Enhancement Mode**: Choose between `fast` (quick contrast stretching), `balanced` (CLAHE + unsharp mask), or `best` (multi-pass optimization).
-- **EXIF Date Back-Filling**:
-  - Click **Backfill EXIF Dates** to write missing `DateTimeOriginal` headers to WhatsApp images or scanned prints using detected filename dates.
+### 3.2 Curate & Organize Section (Runtime Actions)
+- **Options & EXIF**: Adjust perceptual threshold ($0-64$), worker threads, enhancement mode (`balanced`, `fast`, `best`), and trigger one-click **EXIF Date Back-Filling** for WhatsApp/scanned photos.
+- **Duplicates**: Visual comparison of identical and near-identical photos with green **Keeper** badges and 1-click keeper switching.
+- **Triage Queue**: Review text-heavy message forwards, receipts, and memes with 1-click "Keep as Photo" or "Move to Junk".
+- **Burst Shots**: Review rapid-fire photo sequences ($\le 3$s) with Laplacian sharpness scores, dynamic range scores, and one-click **Keep Best Only** triage.
+- **Organize Now**: Moves kept photos into `YYYY/YYYY-MM/`, standalone videos into `video/YYYY/YYYY-MM/`, duplicates to `to-be-deleted/`, and automatically updates your People, Flashbacks, and History with the new file locations!
 
 ---
 
-### 3.3 Tab 2: Duplicates Resolution
-- Displays visual duplicate clusters side-by-side.
-- The system automatically highlights the **Keeper** (highest resolution, largest file size, or sharpest image) with a green badge.
-- **Override Keeper**: Click any duplicate thumbnail to switch the designated keeper.
-- **Keep All**: Click **Keep All** on any cluster to prevent moving any copy to `to-be-deleted/`.
-- **Apply Resolution**: Click **Organize Library** to move non-keepers into `to-be-deleted/YYYY/YYYY-MM/`.
+### 3.3 Explore & View Section (Library Browsing)
+- **People Albums**: Powered by OpenCV YuNet neural face detection and SFace 128-dimensional biometric embeddings. Clusters photos by genuine facial geometry (not color). Supports inline renaming and person photo galleries.
+- **Flashbacks**: "On This Day" anniversary memory cards showcasing photos taken on today's calendar date in previous years.
+- **World Map**: Interactive Leaflet GPS map with reverse-geocoded city and country marker clusters.
+- **AI Semantic Search**: Offline natural language query engine searching by colors, diurnal phases (`sunset`, `golden hour`), seasons (`winter`, `summer`), and locations.
+- **History & Rollback**: Complete SQLite audit trail of every past run with single-click instant rollback (`--undo`).
 
----
-
-### 3.4 Tab 3: Triage Queue
-- Displays borderline text-heavy images, receipts, business cards, and forwards detected by edge-density heuristics.
-- For each item, choose:
-  - **Move to Photos**: Classify as a personal photo (moves to standard `YYYY/YYYY-MM/`).
-  - **Quarantine**: Moves to `maybe-non-relevant/YYYY/YYYY-MM/`.
-
----
 
 ### 3.5 Tab 4: AI Semantic Search
 - 100% offline search using local visual and temporal heuristics.

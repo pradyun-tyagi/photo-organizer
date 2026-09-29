@@ -279,7 +279,7 @@ def scan_library(
     if progress_callback:
         progress_callback("Scan completed successfully.", 1.0, {"ready": True})
 
-    return {
+    scan_result = {
         "root": str(root),
         "total_scanned": len(photos),
         "photos": photos,
@@ -293,6 +293,22 @@ def scan_library(
         "flashbacks": flashback_cards,
         "exif_backfill_count": exif_backfill_count,
     }
+
+    if cache is not None:
+        try:
+            cache.save_studio_state({
+                "root": str(root),
+                "total_scanned": len(photos),
+                "people_albums": people_albums_data,
+                "flashbacks": flashback_cards,
+                "geo_photos": geo_photos,
+                "burst_groups": burst_groups_data,
+                "exif_backfill_count": exif_backfill_count,
+            })
+        except Exception:
+            pass
+
+    return scan_result
 
 
 def organize(
@@ -323,6 +339,9 @@ def organize(
 
     if worker_count <= 0:
         worker_count = get_default_workers()
+
+    if journal is None and not dry_run:
+        journal = Journal(root_dir=root)
 
     run_id = journal.start_run(root, dry_run) if (journal is not None and not dry_run) else None
     cache = PhotoCache(root_dir=root) if enable_cache else None
@@ -409,7 +428,7 @@ def organize(
         destination = destination_for_photo(to_delete_dir, photo, video_folder_name=video_folder_name)
         companions = [c for c in photo.companion_files if not is_video_file(c)] if is_image_file(photo.path) else photo.companion_files
         try:
-            moved, _, companions_moved = move_file_with_companions(
+            moved, dest_final, companions_moved = move_file_with_companions(
                 photo.path,
                 destination,
                 companions,
@@ -420,6 +439,7 @@ def organize(
             if moved:
                 summary.duplicates_moved += 1
                 summary.companions_moved += companions_moved
+                summary.moved_paths_map[str(photo.path.resolve())] = str(dest_final.resolve())
         except OSError as exc:
             summary.warnings += 1
             print(f"WARNING could not move duplicate {photo.path}: {exc}", file=sys.stderr)
@@ -485,7 +505,7 @@ def organize(
 
                 companions = [c for c in photo.companion_files if not is_video_file(c)] if is_image_file(photo.path) else photo.companion_files
                 try:
-                    moved, _, companions_moved = move_file_with_companions(
+                    moved, dest_final, companions_moved = move_file_with_companions(
                         photo.path,
                         destination,
                         companions,
@@ -499,6 +519,7 @@ def organize(
                         else:
                             summary.maybe_non_relevant_moved += 1
                         summary.companions_moved += companions_moved
+                        summary.moved_paths_map[str(photo.path.resolve())] = str(dest_final.resolve())
                         print(f"{folder_label}: {photo.path} ({result.reason})")
                 except OSError as exc:
                     summary.warnings += 1
@@ -528,9 +549,11 @@ def organize(
             if moved:
                 summary.organized_moved += 1
                 summary.companions_moved += companions_moved
+                summary.moved_paths_map[str(photo.path.resolve())] = str(final_path.resolve())
                 updated_paths.append(photo.path if dry_run else final_path)
             else:
                 summary.already_organized += 1
+                summary.moved_paths_map[str(photo.path.resolve())] = str(final_path.resolve())
                 updated_paths.append(final_path)
         except OSError as exc:
             summary.warnings += 1
@@ -594,6 +617,27 @@ def organize(
 
     if run_id:
         journal.complete_run(run_id, summary.__dict__)
+
+    if cache is not None and not dry_run and summary.moved_paths_map:
+        try:
+            cached_state = cache.load_studio_state()
+            if cached_state:
+                for pa in cached_state.get("people_albums", []):
+                    pa["photo_paths"] = [
+                        summary.moved_paths_map.get(str(Path(p).resolve()), p)
+                        for p in pa.get("photo_paths", [])
+                    ]
+                for fb in cached_state.get("flashbacks", []):
+                    for item in fb.get("photos", []):
+                        if "path" in item:
+                            item["path"] = summary.moved_paths_map.get(str(Path(item["path"]).resolve()), item["path"])
+                for gp in cached_state.get("geo_photos", []):
+                    if "path" in gp:
+                        gp["path"] = summary.moved_paths_map.get(str(Path(gp["path"]).resolve()), gp["path"])
+                cached_state["last_summary"] = summary.__dict__
+                cache.save_studio_state(cached_state)
+        except Exception:
+            pass
 
     if progress_callback:
         progress_callback("All tasks complete.", 1.0, {"summary": summary.__dict__})

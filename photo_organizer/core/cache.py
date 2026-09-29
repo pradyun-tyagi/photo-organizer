@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime
@@ -70,6 +71,7 @@ class PhotoCache:
                     pass
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_lookup ON file_cache(file_path, file_size, mtime_ns);")
+            conn.execute("CREATE TABLE IF NOT EXISTS studio_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             conn.commit()
         finally:
             conn.close()
@@ -238,6 +240,44 @@ class PhotoCache:
             conn.commit()
         finally:
             conn.close()
+
+    def set_kv(self, key: str, value: str) -> None:
+        """Stores a key-value pair in the persistent cache."""
+        conn = self._create_connection()
+        try:
+            conn.execute("INSERT OR REPLACE INTO studio_kv (key, value) VALUES (?, ?);", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_kv(self, key: str) -> Optional[str]:
+        """Retrieves a value by key from the persistent cache."""
+        conn = self._create_connection()
+        try:
+            cursor = conn.execute("SELECT value FROM studio_kv WHERE key = ?;", (key,))
+            row = cursor.fetchone()
+            return row["value"] if row else None
+        finally:
+            conn.close()
+
+    def save_studio_state(self, state_dict: Dict) -> None:
+        """Persists the studio state (People albums, Flashbacks, Map pins, Summary) as JSON."""
+        clean_state = {}
+        for k, v in state_dict.items():
+            if k in ("all_photos", "duplicate_clusters_raw"):
+                continue
+            clean_state[k] = v
+        self.set_kv("studio_state", json.dumps(clean_state))
+
+    def load_studio_state(self) -> Optional[Dict]:
+        """Loads previously saved studio state for instant viewing without re-scanning."""
+        raw = self.get_kv("studio_state")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
 
     def close(self) -> None:
         pass
