@@ -475,7 +475,12 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
 
         try:
             with Image.open(file_path) as raw_img:
+                try:
+                    raw_img.draft("RGB", (720, 720))
+                except Exception:
+                    pass
                 img = ImageOps.exif_transpose(raw_img).convert("RGB")
+                img.thumbnail((720, 720), Image.Resampling.BILINEAR)
                 plan = enhancement_plan_for_image(img)
                 if not plan.should_enhance:
                     enhanced = img
@@ -491,6 +496,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                     media_type="image/jpeg",
                     headers={"Cache-Control": "public, max-age=3600"},
                 )
+
         except Exception:
             return image_preview(path)
 
