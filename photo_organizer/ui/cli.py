@@ -35,6 +35,7 @@ def print_summary(summary: ActionSummary) -> None:
     print(f"  maybe non-relevant moved: {summary.maybe_non_relevant_moved}")
     print(f"  organized moves: {summary.organized_moved}")
     print(f"  already organized: {summary.already_organized}")
+    print(f"  exif metadata backfilled: {summary.exif_backfilled}")
     print(f"  enhanced or enhancement dry-run candidates: {summary.enhanced}")
     print(f"  enhancement skipped: {summary.enhancement_skipped}")
     print(f"  empty folders removed: {summary.empty_dirs_removed}")
@@ -113,6 +114,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--skip-non-relevant",
         action="store_true",
         help="Do not screen or move text-forward/text-only images.",
+    )
+    parser.add_argument(
+        "--skip-exif-backfill",
+        action="store_true",
+        help="Skip writing missing EXIF DateTimeOriginal metadata to image headers.",
     )
     parser.add_argument(
         "--visual-threshold",
@@ -245,6 +251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         maybe_non_relevant_folder_name=args.maybe_non_relevant_folder,
         video_folder_name=args.video_folder,
         skip_non_relevant=args.skip_non_relevant,
+        skip_exif_backfill=args.skip_exif_backfill,
         include_videos=args.include_videos,
         max_size_increase_percent=args.max_size_increase,
         worker_count=args.workers,

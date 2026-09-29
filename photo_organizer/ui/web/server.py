@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -21,7 +22,7 @@ except ImportError:
 
 from photo_organizer.core.cache import PhotoCache, ThumbnailCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_inside
-from photo_organizer.core.exif_writer import backfill_library_exif_dates
+from photo_organizer.core.exif_writer import backfill_exif_datetime, backfill_library_exif_dates
 from photo_organizer.core.journal import Journal
 from photo_organizer.core.raw_heif import (
     extract_fast_thumbnail,
@@ -84,6 +85,7 @@ class ExecuteRequest(BaseModel):
     visual_threshold: int = 5
     skip_enhance: bool = False
     skip_non_relevant: bool = False
+    skip_exif_backfill: bool = False
     max_size_increase: float = 20.0
     enhancement_mode: str = "balanced"
     workers: int = 0
@@ -125,6 +127,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             journal_runs = journal.list_runs(limit=10)
 
         exif_count = state.scan_data.get("exif_backfill_count", 0) if state.scan_data else 0
+        exif_candidates = state.scan_data.get("exif_backfill_candidates", []) if state.scan_data else []
 
         return {
             "root_dir": str(state.root_dir) if state.root_dir else None,
@@ -133,6 +136,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             "scan_progress": state.scan_progress,
             "has_scan_data": state.scan_data is not None,
             "exif_backfill_count": exif_count,
+            "exif_backfill_candidates": exif_candidates,
             "last_summary": state.last_summary,
             "journal_runs": journal_runs,
         }
@@ -177,6 +181,8 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
         flashback_count = len(state.scan_data.get("flashbacks", [])) if state.scan_data else 0
         geo_count = len(state.scan_data.get("geo_photos", [])) if state.scan_data else 0
         burst_count = len(state.scan_data.get("burst_groups", [])) if state.scan_data else 0
+        exif_count = state.scan_data.get("exif_backfill_count", 0) if state.scan_data else 0
+        exif_candidates = state.scan_data.get("exif_backfill_candidates", []) if state.scan_data else []
 
         return {
             "status": "ok",
@@ -187,6 +193,8 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             "flashback_count": flashback_count,
             "geo_count": geo_count,
             "burst_count": burst_count,
+            "exif_backfill_count": exif_count,
+            "exif_backfill_candidates": exif_candidates,
             "history_count": len(journal_runs),
             "journal_runs": journal_runs,
         }
@@ -351,6 +359,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 visual_threshold=req.visual_threshold,
                 skip_enhance=req.skip_enhance,
                 skip_non_relevant=req.skip_non_relevant,
+                skip_exif_backfill=req.skip_exif_backfill,
                 include_videos=req.include_videos,
                 video_folder_name=req.video_folder,
                 max_size_increase_percent=req.max_size_increase,
@@ -389,6 +398,9 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                     state.scan_data["non_relevant_items"] = []
                     state.scan_data["maybe_non_relevant_items"] = []
                     state.scan_data.pop("photos", None)
+                    if not req.skip_exif_backfill:
+                        state.scan_data["exif_backfill_count"] = 0
+                        state.scan_data["exif_backfill_candidates"] = []
                     state.custom_keeper_map.clear()
                     state.custom_triage_decisions.clear()
 
@@ -661,18 +673,50 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             return {"flashbacks": []}
         return {"flashbacks": state.scan_data.get("flashbacks", [])}
 
+    @app.get("/api/exif/candidates")
+    def get_exif_candidates():
+        if not state.scan_data:
+            return {"count": 0, "candidates": []}
+        candidates = state.scan_data.get("exif_backfill_candidates", [])
+        return {"count": len(candidates), "candidates": candidates}
+
     @app.post("/api/exif/backfill")
     def backfill_exif(req: ExifBackfillRequest):
-        if not state.scan_data or "photos" not in state.scan_data:
+        if not state.scan_data:
             raise HTTPException(status_code=400, detail="Scan the library first before backfilling EXIF.")
 
-        photos = state.scan_data["photos"]
-        updated_count = backfill_library_exif_dates(photos, dry_run=req.dry_run)
-        return {
-            "status": "ok",
-            "dry_run": req.dry_run,
-            "updated_count": updated_count,
-        }
+        photos = state.scan_data.get("photos")
+        if photos:
+            res = backfill_library_exif_dates(photos, dry_run=req.dry_run)
+            updated_count = res.get("updated", 0) if isinstance(res, dict) else int(res)
+            if not req.dry_run:
+                state.scan_data["exif_backfill_count"] = max(0, state.scan_data.get("exif_backfill_count", 0) - updated_count)
+                state.scan_data["exif_backfill_candidates"] = []
+            return {
+                "status": "ok",
+                "dry_run": req.dry_run,
+                "updated_count": updated_count,
+            }
+        else:
+            candidates = state.scan_data.get("exif_backfill_candidates", [])
+            updated_count = 0
+            for c in candidates:
+                p = Path(c["path"])
+                try:
+                    dt = datetime.strptime(c["resolved_date"], "%Y-%m-%d %H:%M:%S")
+                    success, _ = backfill_exif_datetime(p, dt, dry_run=req.dry_run)
+                    if success:
+                        updated_count += 1
+                except Exception:
+                    pass
+            if not req.dry_run:
+                state.scan_data["exif_backfill_count"] = 0
+                state.scan_data["exif_backfill_candidates"] = []
+            return {
+                "status": "ok",
+                "dry_run": req.dry_run,
+                "updated_count": updated_count,
+            }
 
     @app.get("/api/live-photo-video")
     def live_photo_video(path: str = Query(...)):
@@ -738,6 +782,11 @@ def get_dashboard_html() -> str:
           class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700 hover:bg-amber-50 hover:text-amber-700 border border-slate-200 transition-colors">
           <span class="w-2 h-2 rounded-full bg-amber-500"></span>
           <span id="pill-dedupe">Dedupe: Strict (5)</span>
+        </button>
+        <button onclick="switchTab('tab-options')" title="Click to configure EXIF metadata backfill"
+          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700 hover:bg-sky-50 hover:text-sky-700 border border-slate-200 transition-colors">
+          <span class="w-2 h-2 rounded-full bg-sky-500"></span>
+          <span id="pill-exif">EXIF: Auto Backfill</span>
         </button>
       </div>
 
@@ -1072,12 +1121,18 @@ def get_dashboard_html() -> str:
               <span class="text-xl">📅</span>
               <div>
                 <h3 class="font-bold text-slate-900 text-sm">EXIF Metadata Back-Filling (WhatsApp & Scanned Photos)</h3>
-                <p class="text-xs text-slate-500">Permanently write standard EXIF capture timestamps into image headers</p>
+                <p class="text-xs text-slate-500">Merged into Organize by default • Writes standard EXIF capture timestamps into image headers</p>
               </div>
             </div>
-            <span class="px-2.5 py-1 bg-amber-50 text-amber-800 border border-amber-200 text-xs font-bold rounded-full">
-              <span id="val-exif-backfill-count">0</span> candidates detected
-            </span>
+            <div class="flex items-center gap-3">
+              <span class="px-2.5 py-1 bg-amber-50 text-amber-800 border border-amber-200 text-xs font-bold rounded-full">
+                <span id="val-exif-backfill-count">0</span> candidates detected
+              </span>
+              <label class="relative inline-flex items-center cursor-pointer" title="Auto backfill EXIF during Organize">
+                <input type="checkbox" id="cfg-exif-backfill-enabled" checked onchange="syncOptionsToUI()" class="sr-only peer">
+                <div class="w-11 h-6 bg-slate-200 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div>
+              </label>
+            </div>
           </div>
 
           <div class="space-y-3 text-xs">
@@ -1085,8 +1140,14 @@ def get_dashboard_html() -> str:
               Photos received via WhatsApp, Facebook, or flatbed scanners often lack native EXIF <code>DateTimeOriginal</code> headers. When transferred to a new phone or cloud backup, their capture date can revert to today's date!
             </p>
             <p class="text-slate-600 leading-relaxed">
-              This tool parses the capture date from the WhatsApp filename (e.g. <code>IMG-20240512-WA0001.jpg</code>) or filesystem timestamp, and writes standard EXIF headers (<code>DateTimeOriginal</code>, <code>DateTimeDigitized</code>, <code>DateTime</code>) directly into the image file non-destructively.
+              This feature automatically parses the capture date from the WhatsApp filename (e.g. <code>IMG-20240512-WA0001.jpg</code>) or filesystem timestamp, and writes standard EXIF headers (<code>DateTimeOriginal</code>, <code>DateTimeDigitized</code>, <code>DateTime</code>) directly into the image file non-destructively.
             </p>
+            <div class="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs flex items-center gap-2.5">
+              <span class="text-lg">⚡</span>
+              <div>
+                <strong class="font-bold">Merged by Default:</strong> EXIF back-filling now runs automatically during library organization so your WhatsApp and scanned photo dates are permanently saved without manual steps. You can also preview or trigger it independently below.
+              </div>
+            </div>
             <div class="flex flex-wrap items-center gap-3 pt-2">
               <button onclick="runExifBackfill(true)" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl border border-slate-300 transition-colors">
                 Preview Backfill (Dry Run)
@@ -1095,6 +1156,15 @@ def get_dashboard_html() -> str:
                 Write EXIF Headers Now
               </button>
               <span id="exif-backfill-status" class="text-xs font-semibold text-indigo-700"></span>
+            </div>
+            <!-- Candidate Preview List Container -->
+            <div id="exif-candidates-preview" class="hidden mt-3 pt-3 border-t border-slate-100 space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="font-bold text-slate-700 text-xs">Sample EXIF Back-Fill Candidates:</span>
+                <span id="exif-candidates-shown" class="text-[11px] text-slate-500"></span>
+              </div>
+              <div id="exif-candidates-table" class="max-h-48 overflow-y-auto border border-slate-200 rounded-xl bg-slate-50 divide-y divide-slate-100">
+              </div>
             </div>
           </div>
         </div>
@@ -1365,6 +1435,10 @@ def get_dashboard_html() -> str:
             <span>Organize videos into separate video/YYYY/YYYY-MM/ folder</span>
           </label>
           <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" id="opt-backfill-exif" class="rounded-sm text-indigo-600" checked>
+            <span>Backfill missing EXIF timestamps into image headers (Recommended)</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" id="opt-skip-enhance" class="rounded-sm text-indigo-600">
             <span>Skip image enhancement (organize & dedupe only)</span>
           </label>
@@ -1432,6 +1506,7 @@ def get_dashboard_html() -> str:
       const videos = document.getElementById('cfg-include-videos').checked;
       const thresh = document.getElementById('cfg-threshold-slider').value;
       const screening = document.getElementById('cfg-screening-enabled').checked;
+      const exifBackfill = document.getElementById('cfg-exif-backfill-enabled') ? document.getElementById('cfg-exif-backfill-enabled').checked : true;
 
       document.getElementById('val-cfg-size').textContent = sizeLimit + "%";
       document.getElementById('val-cfg-threshold').textContent = thresh;
@@ -1440,6 +1515,9 @@ def get_dashboard_html() -> str:
       document.getElementById('pill-enhance').textContent = enhance ? `Enhance: ${mode.charAt(0).toUpperCase() + mode.slice(1)} (+${sizeLimit}%)` : "Enhance: Off";
       document.getElementById('pill-videos').textContent = videos ? "Videos: in video/YYYY/YYYY-MM/" : "Videos: Skipped";
       document.getElementById('pill-dedupe').textContent = `Dedupe: ${thresh <= 5 ? 'Strict' : 'Lenient'} (${thresh})`;
+      if (document.getElementById('pill-exif')) {
+        document.getElementById('pill-exif').textContent = exifBackfill ? "EXIF: Auto Backfill" : "EXIF: Skipped";
+      }
     }
 
     async function fetchStatus() {
@@ -1626,6 +1704,9 @@ def get_dashboard_html() -> str:
 
       // 7. Enhancements
       await loadEnhancements();
+
+      // 8. EXIF Candidates
+      await loadExifCandidates();
 
       // If requested (e.g. after fresh initial scan), switch to duplicates or triage tab
       if (autoSwitchTab) {
@@ -2595,6 +2676,43 @@ def get_dashboard_html() -> str:
     }
 
     // --- EXIF Back-fill ---
+    async function loadExifCandidates() {
+      try {
+        const res = await fetch('/api/exif/candidates');
+        if (!res.ok) return;
+        const data = await res.json();
+        const count = data.count || 0;
+        const countEl = document.getElementById('val-exif-backfill-count');
+        if (countEl) countEl.textContent = count;
+        const previewContainer = document.getElementById('exif-candidates-preview');
+        const table = document.getElementById('exif-candidates-table');
+        if (!previewContainer || !table) return;
+
+        if (count > 0 && data.candidates && data.candidates.length > 0) {
+          previewContainer.classList.remove('hidden');
+          const shownEl = document.getElementById('exif-candidates-shown');
+          if (shownEl) shownEl.textContent = `Showing ${data.candidates.length} detected candidate(s)`;
+          table.innerHTML = data.candidates.map(c => `
+            <div class="px-3 py-2 flex items-center justify-between text-[11px]">
+              <div class="truncate mr-3">
+                <span class="font-semibold text-slate-800">${c.filename}</span>
+                <span class="text-slate-400 ml-1.5 font-mono text-[10px]">${c.relative_path || c.path}</span>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold ${c.date_source === 'filename' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'bg-slate-100 text-slate-600'}">${c.date_source}</span>
+                <span class="text-emerald-700 font-mono text-[10px] font-bold">➔ ${c.resolved_date}</span>
+              </div>
+            </div>
+          `).join('');
+        } else {
+          previewContainer.classList.add('hidden');
+          table.innerHTML = '';
+        }
+      } catch (e) {
+        console.error("Failed to load EXIF candidates:", e);
+      }
+    }
+
     async function runExifBackfill(dryRun) {
       const statusSpan = document.getElementById('exif-backfill-status');
       statusSpan.textContent = dryRun ? 'Simulating backfill...' : 'Writing EXIF headers...';
@@ -2609,6 +2727,10 @@ def get_dashboard_html() -> str:
           statusSpan.textContent = dryRun 
             ? `Dry run: ${data.updated_count} photos can be backfilled.` 
             : `Successfully backfilled ${data.updated_count} photos!`;
+          if (!dryRun) {
+            await fetchStatus();
+            await loadExifCandidates();
+          }
         } else {
           statusSpan.textContent = `Error: ${data.detail || 'Failed'}`;
         }
@@ -2631,6 +2753,10 @@ def get_dashboard_html() -> str:
       document.getElementById('opt-include-videos').checked = document.getElementById('cfg-include-videos').checked;
       document.getElementById('opt-skip-enhance').checked = !document.getElementById('cfg-enhance-enabled').checked;
       document.getElementById('opt-skip-non-relevant').checked = !document.getElementById('cfg-screening-enabled').checked;
+      const exifToggle = document.getElementById('cfg-exif-backfill-enabled');
+      if (document.getElementById('opt-backfill-exif')) {
+        document.getElementById('opt-backfill-exif').checked = exifToggle ? exifToggle.checked : true;
+      }
 
       document.getElementById('modal-execute').classList.remove('hidden');
     }
@@ -2640,6 +2766,7 @@ def get_dashboard_html() -> str:
     }
 
     async function confirmExecute() {
+      const exifCheck = document.getElementById('opt-backfill-exif');
       const payload = {
         dry_run: currentDryRun,
         visual_threshold: parseInt(document.getElementById('opt-threshold').value) || 5,
@@ -2649,6 +2776,7 @@ def get_dashboard_html() -> str:
         video_folder: "video",
         skip_enhance: document.getElementById('opt-skip-enhance').checked,
         skip_non_relevant: document.getElementById('opt-skip-non-relevant').checked,
+        skip_exif_backfill: exifCheck ? !exifCheck.checked : false,
         workers: 0
       };
       closeExecuteModal();
@@ -2680,6 +2808,7 @@ def get_dashboard_html() -> str:
     // Initialize
     syncOptionsToUI();
     fetchStatus();
+    loadExifCandidates();
   </script>
 </body>
 </html>

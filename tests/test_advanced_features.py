@@ -1000,6 +1000,87 @@ class AdvancedFeaturesTests(unittest.TestCase):
             self.assertEqual(res2.content, content1)
             self.assertEqual(res2.headers.get("etag"), res1.headers.get("etag"))
 
+    def test_organize_backfills_exif_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wa_photo = root / "IMG-20240512-WA0001.jpg"
+            img = Image.new("RGB", (120, 120), (70, 80, 90))
+            img.save(wa_photo, "JPEG")
+
+            # 1. Verify scan_library detects it as backfill candidate
+            scan_res = scan_library(root, visual_threshold=5, skip_non_relevant=True)
+            self.assertEqual(scan_res["exif_backfill_count"], 1)
+            self.assertEqual(len(scan_res["exif_backfill_candidates"]), 1)
+            candidate = scan_res["exif_backfill_candidates"][0]
+            self.assertEqual(candidate["filename"], "IMG-20240512-WA0001.jpg")
+            self.assertEqual(candidate["date_source"], "filename")
+            self.assertEqual(candidate["resolved_date"], "2024-05-12 00:00:00")
+
+            # 2. Verify organize backfills EXIF metadata by default
+            summary = organize(
+                root,
+                dry_run=False,
+                skip_enhance=True,
+                skip_non_relevant=True,
+            )
+            self.assertEqual(summary.exif_backfilled, 1)
+
+            # 3. Verify organized destination and EXIF headers
+            dest = root / "2024" / "2024-05" / "IMG-20240512-WA0001.jpg"
+            self.assertTrue(dest.exists())
+            with Image.open(dest) as reloaded:
+                exif = reloaded.getexif()
+                self.assertIsNotNone(exif)
+                self.assertEqual(exif.get(36867), "2024:05:12 00:00:00")
+                self.assertEqual(exif.get(306), "2024:05:12 00:00:00")
+
+    def test_organize_respects_skip_exif_backfill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wa_photo = root / "IMG-20240512-WA0002.jpg"
+            img = Image.new("RGB", (120, 120), (70, 80, 90))
+            img.save(wa_photo, "JPEG")
+
+            summary = organize(
+                root,
+                dry_run=False,
+                skip_enhance=True,
+                skip_non_relevant=True,
+                skip_exif_backfill=True,
+            )
+            self.assertEqual(summary.exif_backfilled, 0)
+
+            dest = root / "2024" / "2024-05" / "IMG-20240512-WA0002.jpg"
+            self.assertTrue(dest.exists())
+            with Image.open(dest) as reloaded:
+                exif = reloaded.getexif()
+                self.assertIsNone(exif.get(36867))
+
+    def test_web_api_exif_candidates_and_execute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wa_photo = root / "IMG-20240512-WA0003.jpg"
+            img = Image.new("RGB", (120, 120), (70, 80, 90))
+            img.save(wa_photo, "JPEG")
+
+            app = create_app(root)
+            client = TestClient(app)
+
+            # Trigger scan
+            s_res = client.post("/api/scan")
+            self.assertEqual(s_res.status_code, 200)
+
+            # Check candidates endpoint
+            c_res = client.get("/api/exif/candidates")
+            self.assertEqual(c_res.status_code, 200)
+            c_data = c_res.json()
+            self.assertEqual(c_data["count"], 1)
+            self.assertEqual(c_data["candidates"][0]["filename"], "IMG-20240512-WA0003.jpg")
+
+            # Check dry-run backfill via API
+            bf_res = client.post("/api/exif/backfill", json={"dry_run": True})
+            self.assertEqual(bf_res.status_code, 200)
+            self.assertEqual(bf_res.json()["updated_count"], 1)
 
 
 if __name__ == "__main__":

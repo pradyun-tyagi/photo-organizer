@@ -83,6 +83,7 @@ class ActionSummary:
     maybe_non_relevant_moved: int = 0
     organized_moved: int = 0
     already_organized: int = 0
+    exif_backfilled: int = 0
     enhanced: int = 0
     enhancement_skipped: int = 0
     empty_dirs_removed: int = 0

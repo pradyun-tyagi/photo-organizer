@@ -17,6 +17,7 @@ from photo_organizer.config import (
 )
 from photo_organizer.core.cache import PhotoCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_video_file
+from photo_organizer.core.exif_writer import backfill_exif_datetime
 from photo_organizer.core.file_ops import (
     destination_for_photo,
     move_file,
@@ -275,8 +276,19 @@ def scan_library(
     # 4. Flashback memories ("On This Day")
     flashback_cards = get_flashback_cards(photos)
 
-    # 5. EXIF backfill candidates
-    exif_backfill_count = len([p for p in photos if p.date_source != "exif" and not p.is_video])
+    # 5. EXIF backfill candidates (WhatsApp, scans, filename/mtime dates)
+    exif_backfill_candidates = [
+        {
+            "path": str(p.path),
+            "relative_path": str(p.path.relative_to(root)),
+            "resolved_date": p.taken_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "date_source": p.date_source,
+            "filename": p.path.name,
+        }
+        for p in photos
+        if p.date_source != "exif" and not p.is_video and is_image_file(p.path)
+    ]
+    exif_backfill_count = len(exif_backfill_candidates)
 
     # 6. Adaptive Enhancement candidates for Studio review
     enhancement_candidates = []
@@ -326,6 +338,7 @@ def scan_library(
         "people_albums": people_albums_data,
         "flashbacks": flashback_cards,
         "exif_backfill_count": exif_backfill_count,
+        "exif_backfill_candidates": exif_backfill_candidates[:150],
         "enhancement_candidates": enhancement_candidates,
     }
 
@@ -339,6 +352,7 @@ def scan_library(
                 "geo_photos": geo_photos,
                 "burst_groups": burst_groups_data,
                 "exif_backfill_count": exif_backfill_count,
+                "exif_backfill_candidates": exif_backfill_candidates[:150],
                 "enhancement_candidates": enhancement_candidates,
             })
         except Exception:
@@ -358,6 +372,7 @@ def organize(
     maybe_non_relevant_folder_name: str = DEFAULT_MAYBE_NON_RELEVANT_FOLDER,
     video_folder_name: str = DEFAULT_VIDEO_FOLDER,
     skip_non_relevant: bool = False,
+    skip_exif_backfill: bool = False,
     include_videos: bool = True,
     max_size_increase_percent: float = DEFAULT_MAX_SIZE_INCREASE,
     worker_count: int = 0,
@@ -621,7 +636,72 @@ def organize(
             summary.warnings += 1
             print(f"WARNING could not organize {photo.path}: {exc}", file=sys.stderr)
 
-    # 4. Enhance kept pictures
+    # 4. Backfill EXIF metadata for photos missing native EXIF dates (WhatsApp, scans, etc.)
+    if not skip_exif_backfill:
+        backfill_candidates = []
+        for p in relevant_photos:
+            if p.date_source != "exif" and not p.is_video:
+                final_path_str = summary.moved_paths_map.get(str(p.path.resolve()))
+                current_path = Path(final_path_str) if final_path_str else (p.path if dry_run else destination_for_photo(root, p, video_folder_name=video_folder_name))
+                check_path = p.path if dry_run else current_path
+                if is_image_file(check_path):
+                    backfill_candidates.append((p, current_path))
+
+        total_backfill = len(backfill_candidates)
+        if total_backfill > 0:
+            if progress_callback:
+                progress_callback(
+                    f"Backfilling EXIF metadata ({total_backfill:,} photos)...",
+                    0.72,
+                    {"total": total_backfill},
+                )
+
+            def _backfill_worker(item: Tuple[PhotoInfo, Path]) -> Tuple[PhotoInfo, Path, bool, str]:
+                photo, cur_path = item
+                success, msg = backfill_exif_datetime(cur_path, photo.taken_at, dry_run=dry_run)
+                return photo, cur_path, success, msg
+
+            def _backfill_progress(completed: int, total: int):
+                pct = 0.72 + 0.05 * (completed / total)
+                if progress_callback:
+                    progress_callback(
+                        f"Backfilling EXIF metadata ({completed:,} / {total:,})...",
+                        pct,
+                        {"completed": completed, "total": total},
+                    )
+
+            backfill_results = parallel_map(
+                backfill_candidates,
+                worker_count,
+                _backfill_worker,
+                on_progress=_backfill_progress,
+            )
+
+            cache_updates = []
+            for photo, cur_path, success, msg in backfill_results:
+                if success:
+                    summary.exif_backfilled += 1
+                    photo.date_source = "exif"
+                    if not dry_run:
+                        if journal and run_id:
+                            journal.record_action(
+                                run_id=run_id,
+                                action_type="EXIF_BACKFILL",
+                                source_path=str(cur_path),
+                                dest_path=str(cur_path),
+                                details=msg,
+                            )
+                        try:
+                            st = cur_path.stat()
+                            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+                            cache_updates.append((photo, mtime_ns))
+                        except OSError:
+                            pass
+
+            if cache and cache_updates:
+                cache.set_bulk(cache_updates)
+
+    # 5. Enhance kept pictures
     if skip_enhance:
         removed, warnings = remove_empty_dirs(root, dry_run, journal=journal, run_id=run_id)
         summary.empty_dirs_removed += removed
