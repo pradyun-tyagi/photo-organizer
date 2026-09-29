@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import tempfile
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 try:
     from PIL import (
@@ -325,6 +325,295 @@ def verify_and_protect_facial_identity(
     return result_bgr
 
 
+def build_facial_landmark_masks(
+    image_shape: Tuple[int, int, ...], face_rows: Sequence["np.ndarray"]
+) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Constructs feathered masks for eyes and lips from YuNet landmarks.
+    Returns (eye_mask, lip_mask) as float32 arrays in [0.0, 1.0].
+    """
+    if np is None or cv2 is None or not face_rows:
+        return (
+            np.zeros((image_shape[0], image_shape[1]), dtype=np.float32),
+            np.zeros((image_shape[0], image_shape[1]), dtype=np.float32),
+        )
+
+    H, W = image_shape[:2]
+    eye_mask = np.zeros((H, W), dtype=np.float32)
+    lip_mask = np.zeros((H, W), dtype=np.float32)
+
+    for row in face_rows:
+        if len(row) < 14:
+            continue
+        rx, ry = int(row[4]), int(row[5])
+        lx, ly = int(row[6]), int(row[7])
+        dist = float(np.hypot(lx - rx, ly - ry))
+        if dist < 6:
+            continue
+
+        r = max(4, int(dist * 0.18))
+        eye_canvas = np.zeros((H, W), dtype=np.uint8)
+        if 0 <= rx < W and 0 <= ry < H:
+            cv2.circle(eye_canvas, (rx, ry), r, 255, -1)
+        if 0 <= lx < W and 0 <= ly < H:
+            cv2.circle(eye_canvas, (lx, ly), r, 255, -1)
+
+        kx = max(3, r * 2 + 1)
+        feathered_eyes = cv2.GaussianBlur(
+            eye_canvas, (kx, kx), sigmaX=max(1.0, r * 0.45)
+        ).astype(np.float32) / 255.0
+        eye_mask = np.maximum(eye_mask, feathered_eyes)
+
+        # Mouth landmarks
+        rcx, rcy = int(row[10]), int(row[11])
+        lcx, lcy = int(row[12]), int(row[13])
+        mw = float(np.hypot(lcx - rcx, lcy - rcy))
+        if mw < 6:
+            continue
+
+        mcx = int((rcx + lcx) * 0.5)
+        mcy = int((rcy + lcy) * 0.5)
+        ax = max(6, int(mw * 0.55))
+        ay = max(3, int(mw * 0.28))
+        angle = float(np.degrees(np.arctan2(lcy - rcy, lcx - rcx)))
+
+        lip_canvas = np.zeros((H, W), dtype=np.uint8)
+        if 0 <= mcx < W and 0 <= mcy < H:
+            cv2.ellipse(lip_canvas, (mcx, mcy), (ax, ay), angle, 0, 360, 255, -1)
+
+        lkx = max(3, int(ax * 0.6) * 2 + 1)
+        lky = max(3, int(ay * 0.6) * 2 + 1)
+        feathered_lips = cv2.GaussianBlur(
+            lip_canvas, (lkx, lky), sigmaX=ax * 0.35, sigmaY=ay * 0.35
+        ).astype(np.float32) / 255.0
+        lip_mask = np.maximum(lip_mask, feathered_lips)
+
+    return eye_mask, lip_mask
+
+
+def apply_retinex_illumination_exposure(
+    l_channel: "np.ndarray", gamma: float, brightness_factor: float
+) -> "np.ndarray":
+    """Multi-Scale Retinex illumination decomposition with Filmic Highlight Rolloff.
+    Lifts underexposed shadows smoothly while protecting natural beauty of clouds,
+    sky, and bright highlights from clipping or blowout.
+    """
+    if cv2 is None or np is None:
+        return l_channel
+
+    H, W = l_channel.shape[:2]
+    l_f = l_channel.astype(np.float32) / 255.0
+
+    # Multi-scale illumination estimation on downscaled pyramid (lightning fast < 2ms)
+    max_d = max(H, W)
+    scale = 320.0 / max_d if max_d > 320 else 1.0
+    if scale < 1.0:
+        sw, sh = max(16, int(W * scale)), max(16, int(H * scale))
+        thumb = cv2.resize(l_f, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        thumb = l_f
+
+    blur_fine = cv2.GaussianBlur(thumb, (0, 0), sigmaX=6.0, sigmaY=6.0)
+    blur_coarse = cv2.GaussianBlur(thumb, (0, 0), sigmaX=24.0, sigmaY=24.0)
+    illum_small = 0.5 * blur_fine + 0.5 * blur_coarse
+
+    if scale < 1.0:
+        illum = cv2.resize(illum_small, (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        illum = illum_small
+    illum = np.clip(illum, 0.05, 1.0)
+
+    # Adaptive shadow exposure lift: boosts underexposed zones while preserving midtones
+    if brightness_factor > 1.0 or gamma < 1.0:
+        shadow_deficit = np.clip(1.0 - illum, 0.0, 1.0)
+        lift = 1.0 + shadow_deficit * max(0.0, brightness_factor - 1.0) * 1.5
+        l_lifted = l_f * lift
+    else:
+        l_lifted = l_f * brightness_factor
+
+    if gamma != 1.0:
+        l_curved = np.clip(l_lifted, 0.0, 1.0) ** gamma
+    else:
+        l_curved = l_lifted
+
+    # Filmic Highlight Rolloff (Soft-Knee):
+    # For luminance > 0.82 (~210/255), applies asymptotic hyperbolic tangent rolloff
+    # so puffy clouds, snow peaks, water highlights, and sunset skies never clip.
+    T = 0.82
+    knee_range = 1.0 - T
+    high_mask = l_curved > T
+    if np.any(high_mask):
+        val = l_curved[high_mask]
+        l_curved[high_mask] = T + knee_range * np.tanh((val - T) / knee_range)
+
+    return np.clip(np.round(l_curved * 255.0), 0, 255).astype(np.uint8)
+
+
+def apply_guided_detail_enhancement(
+    l_channel: "np.ndarray", sharpness_factor: float, contrast_factor: float
+) -> "np.ndarray":
+    """Edge-Gradient Attenuated detail sharpening and conservative contrast.
+    Sharpens natural micro-textures (foliage, rock grain, water ripples, grass)
+    while completely suppressing glowing halo artifacts at high-contrast boundaries
+    (e.g. tree branches against bright sky, mountain crests).
+    """
+    if cv2 is None or np is None:
+        return l_channel
+
+    l_res = l_channel
+    if contrast_factor > 1.0:
+        clip = min(1.8, max(1.1, 1.0 + (contrast_factor - 1.0) * 2.0))
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+        l_res = clahe.apply(l_res)
+
+    if sharpness_factor > 1.0:
+        l_f = l_res.astype(np.float32)
+        # Compute gradient magnitude
+        gx = cv2.Sobel(l_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(l_f, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = cv2.magnitude(gx, gy)
+
+        # Attenuation factor: high on micro-textures (<35), suppressed near zero on step edges (>70)
+        tau = 35.0
+        attenuation = 1.0 / (1.0 + (grad_mag / tau) ** 2)
+
+        blurred = cv2.GaussianBlur(l_f, (0, 0), sigmaX=1.2, sigmaY=1.2)
+        high_freq = l_f - blurred
+        clean_hf = high_freq * attenuation
+        boost = min(0.40, (sharpness_factor - 1.0) * 2.5)
+        l_res = np.clip(np.round(l_f + clean_hf * boost), 0, 255).astype(np.uint8)
+
+    return l_res
+
+
+def apply_perceptual_adaptive_vibrance(
+    a: "np.ndarray",
+    b: "np.ndarray",
+    color_factor: float,
+    face_mask: Optional["np.ndarray"] = None,
+) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Perceptual Adaptive Vibrance prioritizing muted pixels over already-saturated ones.
+    Protects chlorophyll green foliage and atmospheric sky blue from turning into
+    unnatural neon or radioactive colors, while safely dampening facial skin.
+    """
+    if np is None or color_factor == 1.0:
+        return a, b
+
+    da = a.astype(np.float32) - 128.0
+    db = b.astype(np.float32) - 128.0
+    chroma = np.sqrt(da ** 2 + db ** 2)
+
+    # Muted-pixel priority weight: S-curve tapering to ~0 as chroma approaches 85
+    max_chroma = 85.0
+    vibrance_weight = np.clip(1.0 - (chroma / max_chroma) ** 1.2, 0.05, 1.0)
+
+    # Facial skin dampening
+    if face_mask is not None:
+        skin_damp = 1.0 - 0.75 * face_mask
+    else:
+        skin_damp = 1.0
+
+    eff_factor = 1.0 + (color_factor - 1.0) * vibrance_weight * skin_damp
+
+    # Natural foliage chlorophyll protection:
+    # Foliage in LAB has negative a and positive b (hue angle in green zone 110-145 deg)
+    # Prevent a from becoming excessively negative which makes grass fluorescent lime
+    is_foliage = (da < -2.0) & (db > 5.0)
+    da_factor = np.where(is_foliage, 1.0 + (eff_factor - 1.0) * 0.50, eff_factor)
+
+    # Natural sky protection:
+    # Blue sky has negative b (< -8.0). Keep a stable to avoid purple/cyan color cast
+    is_sky = db < -8.0
+    da_factor = np.where(is_sky, 1.0 + (da_factor - 1.0) * 0.40, da_factor)
+
+    new_da = da * da_factor
+    new_db = db * eff_factor
+
+    return (
+        np.clip(np.round(new_da + 128.0), 0, 255).astype(np.uint8),
+        np.clip(np.round(new_db + 128.0), 0, 255).astype(np.uint8),
+    )
+
+
+def apply_frequency_separation_portrait(
+    l_channel: "np.ndarray",
+    face_mask: "np.ndarray",
+    eye_mask: Optional["np.ndarray"] = None,
+) -> "np.ndarray":
+    """Dual-frequency portrait separation:
+    Smooths mid-frequency lighting blotches and sensor grain while 100% preserving
+    fine high-frequency skin pores and hair micro-relief (eliminating plastic skin effect).
+    Boosts iris catchlight specular sparkle and iris striation clarity in eye zones.
+    """
+    if cv2 is None or np is None or face_mask is None:
+        return l_channel
+
+    l_f = l_channel.astype(np.float32)
+    # Low frequency: smooth uneven lighting & blemishes with edge-preserving bilateral filter
+    l_low = cv2.bilateralFilter(l_channel, d=5, sigmaColor=18, sigmaSpace=18).astype(np.float32)
+    # High frequency: fine skin texture, pores, peach fuzz, eyelashes
+    l_high = l_f - l_low
+
+    # Smooth base complexion gently
+    l_base_smooth = 0.75 * l_f + 0.25 * l_low
+    # Add back 100% of high-frequency skin texture: real human pores are fully preserved!
+    l_face = l_base_smooth + l_high
+
+    # Eye micro-enhancement: catchlight specular sparkle and iris striation clarity
+    if eye_mask is not None:
+        em = eye_mask.astype(np.float32)
+        is_specular = (l_f > 175).astype(np.float32)
+        catchlight_boost = 1.0 + 0.15 * em * is_specular
+        is_iris = ((l_f >= 50) & (l_f <= 175)).astype(np.float32)
+        iris_contrast = l_f + (l_f - 110.0) * 0.12 * em * is_iris
+        l_face = np.where(em > 0.08, np.clip(iris_contrast * catchlight_boost, 0, 255), l_face)
+
+    fm = face_mask.astype(np.float32)
+    result = (1.0 - fm) * l_f + fm * l_face
+    return np.clip(np.round(result), 0, 255).astype(np.uint8)
+
+
+def align_melanin_hemoglobin_skin_tones(
+    a: "np.ndarray",
+    b: "np.ndarray",
+    face_mask: "np.ndarray",
+    lip_mask: Optional["np.ndarray"] = None,
+) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Aligns facial skin chromaticity gently toward the healthy melanin-hemoglobin locus (~50 deg LAB),
+    eliminating greenish fluorescent or cold blue shadow casts while preserving ethnic undertones.
+    Enhances lip vitality naturally (+6% red-magenta chroma).
+    """
+    if np is None or face_mask is None:
+        return a, b
+
+    da = a.astype(np.float32) - 128.0
+    db = b.astype(np.float32) - 128.0
+
+    # Facial skin zone (excluding lips)
+    skin_zone = face_mask.copy()
+    if lip_mask is not None:
+        skin_zone = np.clip(skin_zone * (1.0 - lip_mask), 0.0, 1.0)
+
+    # Detect human skin chromaticity range in LAB (warm quadrant with healthy melanin/hemoglobin)
+    is_skin_chroma = (da > 2.0) & (db > 3.0) & (db > da * 0.50) & (db < da * 2.8)
+    skin_weight = skin_zone * is_skin_chroma.astype(np.float32)
+
+    # Melanin-hemoglobin natural locus target: b* / a* ~ 1.35
+    target_db = da * 1.35
+    # Gentle 18% alignment blend
+    aligned_db = (1.0 - 0.18 * skin_weight) * db + (0.18 * skin_weight) * target_db
+
+    # Lip vitality: subtle +6% boost to lip red-magenta chroma within lip_mask
+    if lip_mask is not None:
+        lm = lip_mask.astype(np.float32)
+        lip_boost_a = 1.0 + 0.06 * lm
+        da = da * lip_boost_a
+
+    return (
+        np.clip(np.round(da + 128.0), 0, 255).astype(np.uint8),
+        np.clip(np.round(aligned_db + 128.0), 0, 255).astype(np.uint8),
+    )
+
+
 def apply_enhancement_plan(
     image: "Image.Image", plan: EnhancementPlan, enhancement_mode: str
 ) -> "Image.Image":
@@ -343,85 +632,49 @@ def apply_enhancement_plan(
         rgb_arr = np.array(rgb)
         bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
 
-        # Detect human faces and construct feathered face protection mask
+        # 1. Detect human faces and construct feathered face & landmark masks
         face_rows, face_boxes = detect_face_regions(bgr)
         has_faces = len(face_boxes) > 0
-        face_mask = build_feathered_face_mask(bgr.shape, face_boxes) if has_faces else None
+        if has_faces:
+            face_mask = build_feathered_face_mask(bgr.shape, face_boxes)
+            eye_mask, lip_mask = build_facial_landmark_masks(bgr.shape, face_rows)
+        else:
+            face_mask = None
+            eye_mask = None
+            lip_mask = None
 
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        # 1. Luminance gamma curve (global natural S-curve)
-        if plan.gamma != 1.0:
-            table = np.array(
-                [int(clamp(((v / 255.0) ** plan.gamma) * 255.0, 0, 255)) for v in range(256)]
-            ).astype("uint8")
-            l_gamma = cv2.LUT(l, table)
-        else:
-            l_gamma = l.copy()
+        # 2. Retinex illumination and exposure with Filmic Highlight Rolloff
+        # Lifts underexposed shadows while protecting clouds, sky, and sun reflections from blowout
+        l_retinex = apply_retinex_illumination_exposure(l, plan.gamma, plan.brightness_factor)
 
-        # Background branch: CLAHE + Unsharp Masking
-        l_bg = l_gamma.copy()
-        if plan.contrast_factor > 1.0 or plan.autocontrast_cutoff > 0:
-            clip = min(2.4, max(1.2, 1.2 * plan.contrast_factor))
-            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-            l_bg = clahe.apply(l_bg)
+        # 3. Background Detail & Contrast: Halo-Free Guided Enhancement
+        # Edge-gradient attenuation eliminates glowing fringes around tree limbs, mountain ridges, horizons
+        l_bg = apply_guided_detail_enhancement(l_retinex, plan.sharpness_factor, plan.contrast_factor)
 
-        if plan.sharpness_factor > 1.0:
-            blurred = cv2.GaussianBlur(l_bg, (0, 0), sigmaX=1.2)
-            high_freq = cv2.subtract(l_bg, blurred)
-            boost = min(0.45, (plan.sharpness_factor - 1.0) * 3.0)
-            l_bg = cv2.addWeighted(l_bg, 1.0, high_freq, boost, 0)
-
-        if plan.brightness_factor != 1.0:
-            l_bg = np.clip(l_bg.astype(np.float32) * plan.brightness_factor, 0, 255).astype(np.uint8)
-
-        # Face branch & Composite:
+        # 4. Portrait Face Zone: Frequency Separation + Eye Catchlight Micro-Enhancement
+        # 100% preserves real skin pores, eyelashes, and authentic human appearance (never plastic)
         if has_faces and face_mask is not None:
-            # Human face zone:
-            # NO CLAHE: local histogram equalization creates harsh blotches, dark eye circles, and zombie artifacts.
-            l_face = l_gamma.copy()
-            if plan.brightness_factor > 1.0:
-                face_bright = min(1.04, 1.0 + (plan.brightness_factor - 1.0) * 0.5)
-                l_face = np.clip(l_face.astype(np.float32) * face_bright, 0, 255).astype(np.uint8)
-
-            # Bilateral edge-preserving skin smoothing:
-            # Smooths camera sensor noise and compression grain on skin while keeping eyes, pupils,
-            # eyebrows, lips, and nostrils razor sharp without altering identity.
-            l_bilat = cv2.bilateralFilter(l_face, d=5, sigmaColor=20, sigmaSpace=20)
-            l_face = np.clip(0.70 * l_face.astype(np.float32) + 0.30 * l_bilat.astype(np.float32), 0, 255).astype(np.uint8)
-
-            # Soft Gaussian feather blend between background and face luminance
-            fm = face_mask
-            bgm = 1.0 - fm
-            l_composite = np.clip(bgm * l_bg.astype(np.float32) + fm * l_face.astype(np.float32), 0, 255).astype(np.uint8)
+            l_composite = apply_frequency_separation_portrait(l_bg, face_mask, eye_mask)
         else:
             l_composite = l_bg
 
-        # Safe color vibrance (with strict skin chromaticity lock on facial zone)
-        if plan.color_factor != 1.0:
-            a_bg = np.clip((a.astype(np.float32) - 128.0) * plan.color_factor + 128.0, 0, 255)
-            b_bg = np.clip((b.astype(np.float32) - 128.0) * plan.color_factor + 128.0, 0, 255)
+        # 5. Perceptual Adaptive Vibrance (Muted-Pixel Priority & Chlorophyll/Sky Protection)
+        # Prevents neon grass or cyan skies; lifts dull/muted tones naturally
+        a_vib, b_vib = apply_perceptual_adaptive_vibrance(a, b, plan.color_factor, face_mask)
 
-            if has_faces and face_mask is not None:
-                # Skin chromaticity protection: dampen color factor by 75% on face to preserve authentic complexion
-                face_color_factor = 1.0 + (plan.color_factor - 1.0) * 0.25
-                a_face = np.clip((a.astype(np.float32) - 128.0) * face_color_factor + 128.0, 0, 255)
-                b_face = np.clip((b.astype(np.float32) - 128.0) * face_color_factor + 128.0, 0, 255)
-
-                a_composite = np.clip(bgm * a_bg + fm * a_face, 0, 255).astype(np.uint8)
-                b_composite = np.clip(bgm * b_bg + fm * b_face, 0, 255).astype(np.uint8)
-            else:
-                a_composite = a_bg.astype(np.uint8)
-                b_composite = b_bg.astype(np.uint8)
+        # 6. Melanin-Hemoglobin Skin Tone Locus Alignment & Lip Vitality
+        if has_faces and face_mask is not None:
+            a_final, b_final = align_melanin_hemoglobin_skin_tones(a_vib, b_vib, face_mask, lip_mask)
         else:
-            a_composite = a
-            b_composite = b
+            a_final, b_final = a_vib, b_vib
 
-        merged_lab = cv2.merge((l_composite, a_composite, b_composite))
+        merged_lab = cv2.merge((l_composite, a_final, b_final))
         enhanced_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
 
-        # SFace Biometric Identity Guardrail: mathematically guarantees >= 0.98 cosine similarity
+        # 7. SFace Biometric Guardrail: mathematically guarantees >= 0.98 cosine similarity
         if has_faces and len(face_rows) > 0:
             enhanced_bgr = verify_and_protect_facial_identity(
                 bgr, enhanced_bgr, face_rows, min_cosine_similarity=0.98

@@ -785,6 +785,92 @@ class AdvancedFeaturesTests(unittest.TestCase):
         enhanced = apply_enhancement_plan(test_img, plan, "balanced")
         self.assertEqual(enhanced.size, (150, 150))
 
+    def test_sota_natural_beauty_and_facial_enhancement_pipeline(self):
+        import numpy as np
+        from photo_organizer.vision.enhancer import (
+            build_facial_landmark_masks,
+            apply_retinex_illumination_exposure,
+            apply_guided_detail_enhancement,
+            apply_perceptual_adaptive_vibrance,
+            apply_frequency_separation_portrait,
+            align_melanin_hemoglobin_skin_tones,
+            apply_enhancement_plan,
+        )
+        from photo_organizer.models import EnhancementPlan
+
+        # 1. Landmark masks (eyes and lips)
+        face_row = np.array([30, 30, 80, 80, 50, 50, 90, 50, 70, 70, 60, 90, 80, 90, 0.99], dtype=np.float32)
+        eye_mask, lip_mask = build_facial_landmark_masks((150, 150), [face_row])
+        self.assertEqual(eye_mask.shape, (150, 150))
+        self.assertEqual(lip_mask.shape, (150, 150))
+        self.assertGreater(eye_mask[50, 50], 0.5)
+        self.assertGreater(eye_mask[50, 90], 0.5)
+        self.assertEqual(eye_mask[0, 0], 0.0)
+        self.assertGreater(lip_mask[90, 70], 0.5)
+        self.assertEqual(lip_mask[0, 0], 0.0)
+
+        # 2. Retinex with filmic highlight rolloff (protects clouds and highlights from blowout)
+        l_chan = np.full((100, 100), 220, dtype=np.uint8)
+        l_chan[0:50, :] = 40  # underexposed half
+        l_res = apply_retinex_illumination_exposure(l_chan, gamma=0.85, brightness_factor=1.05)
+        self.assertEqual(l_res.shape, (100, 100))
+        # Underexposed region was lifted
+        self.assertGreater(int(l_res[25, 25]), 40)
+        # Highlight region (220) was softly rolled off and not clipped to 255 pure white blowout
+        self.assertLess(int(l_res[75, 75]), 255)
+
+        # 3. Halo-free detail enhancement (edge-gradient attenuation)
+        test_l = np.full((100, 100), 100, dtype=np.uint8)
+        test_l[10:30, 10:30] = np.random.randint(95, 105, (20, 20), dtype=np.uint8)
+        test_l[:, 50:] = 220
+        enhanced_l = apply_guided_detail_enhancement(test_l, sharpness_factor=1.15, contrast_factor=1.05)
+        self.assertEqual(enhanced_l.shape, (100, 100))
+
+        # 4. Perceptual adaptive vibrance (protects already saturated sky/foliage)
+        a_chan = np.full((50, 50), 128, dtype=np.uint8)
+        b_chan = np.full((50, 50), 128, dtype=np.uint8)
+        a_chan[10, 10] = 140
+        b_chan[10, 10] = 140
+        a_chan[30, 30] = 180
+        b_chan[30, 30] = 180
+        new_a, new_b = apply_perceptual_adaptive_vibrance(a_chan, b_chan, color_factor=1.10)
+        muted_boost = (float(new_a[10, 10]) - 128.0) / (140.0 - 128.0)
+        sat_boost = (float(new_a[30, 30]) - 128.0) / (180.0 - 128.0)
+        self.assertGreater(muted_boost, sat_boost)
+
+        # 5. Frequency separation portrait (preserves micro pores)
+        face_mask = np.zeros((100, 100), dtype=np.float32)
+        face_mask[20:80, 20:80] = 1.0
+        face_l = np.full((100, 100), 120, dtype=np.uint8)
+        face_l[40:60, 40:60] = np.random.randint(115, 126, (20, 20), dtype=np.uint8)
+        res_face_l = apply_frequency_separation_portrait(face_l, face_mask, eye_mask=None)
+        self.assertEqual(res_face_l.shape, (100, 100))
+        std_enhanced = float(np.std(res_face_l[40:60, 40:60]))
+        self.assertGreater(std_enhanced, 0.5)
+
+        # 6. Melanin-hemoglobin alignment & lip vitality
+        a_face = np.full((80, 80), 140, dtype=np.uint8)
+        b_face = np.full((80, 80), 135, dtype=np.uint8)
+        fm = np.ones((80, 80), dtype=np.float32)
+        lm = np.zeros((80, 80), dtype=np.float32)
+        lm[50:60, 30:50] = 1.0
+        al_a, al_b = align_melanin_hemoglobin_skin_tones(a_face, b_face, fm, lm)
+        self.assertGreater(int(al_b[20, 20]), int(b_face[20, 20]))
+        self.assertGreater(int(al_a[55, 40]), int(a_face[55, 40]))
+
+        # 7. Natural foliage and sky protection
+        # Foliage: da < -2, db > 5 (e.g. da = -10, db = +15 -> a=118, b=143)
+        a_foliage = np.full((30, 30), 118, dtype=np.uint8)
+        b_foliage = np.full((30, 30), 143, dtype=np.uint8)
+        res_a_fol, res_b_fol = apply_perceptual_adaptive_vibrance(a_foliage, b_foliage, color_factor=1.20)
+        self.assertGreater(int(res_a_fol[15, 15]), 110)
+
+        # Sky: db < -8 (e.g. da = 0, db = -20 -> a=128, b=108)
+        a_sky = np.full((30, 30), 128, dtype=np.uint8)
+        b_sky = np.full((30, 30), 108, dtype=np.uint8)
+        res_a_sky, res_b_sky = apply_perceptual_adaptive_vibrance(a_sky, b_sky, color_factor=1.20)
+        self.assertAlmostEqual(int(res_a_sky[15, 15]), 128, delta=2)
+
     def test_enhancement_api_endpoints_and_organize_filtering(self):
         from photo_organizer.ui.web.server import create_app
         from photo_organizer.organizer import organize
