@@ -313,6 +313,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                     state.scan_data["duplicate_clusters"] = []
                     state.scan_data["non_relevant_items"] = []
                     state.scan_data["maybe_non_relevant_items"] = []
+                    state.scan_data.pop("photos", None)
                     state.custom_keeper_map.clear()
                     state.custom_triage_decisions.clear()
 
@@ -323,6 +324,8 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                     loaded = cache.load_studio_state()
                     if loaded:
                         state.scan_data = loaded
+
+            _on_progress("Organization complete.", 1.0, {"summary": state.last_summary})
         except Exception as exc:
             _on_progress(f"Organize error: {exc}", 0.0, {"error": str(exc)})
         finally:
@@ -1239,8 +1242,22 @@ def get_dashboard_html() -> str:
         } else {
           badge.className = "inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800";
           badge.textContent = "Ready";
-          if (data.scan_progress && data.scan_progress.percent >= 100) {
-            setTimeout(() => progressContainer.classList.add('hidden'), 2500);
+
+          if (data.scan_progress && data.scan_progress.stage && data.scan_progress.stage.startsWith("Organize error")) {
+            progressStage.innerHTML = `<span class="text-rose-600 font-bold">⚠️ ${data.scan_progress.stage}</span>`;
+            progressBar.style.width = "100%";
+            progressBar.className = "h-2.5 rounded-full transition-all duration-300 bg-rose-500";
+            setTimeout(() => {
+              progressContainer.classList.add('hidden');
+              progressBar.className = "h-2.5 rounded-full transition-all duration-300 bg-indigo-600";
+            }, 6000);
+          } else if (data.scan_progress && data.scan_progress.percent >= 99) {
+            progressPercent.textContent = "100%";
+            progressBar.style.width = "100%";
+            progressStage.innerHTML = `<span class="text-emerald-700 font-semibold">✓ ${data.scan_progress.stage || "Complete"}</span>`;
+            setTimeout(() => progressContainer.classList.add('hidden'), 2000);
+          } else {
+            progressContainer.classList.add('hidden');
           }
         }
 

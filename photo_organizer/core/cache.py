@@ -264,10 +264,10 @@ class PhotoCache:
         """Persists the studio state (People albums, Flashbacks, Map pins, Summary) as JSON."""
         clean_state = {}
         for k, v in state_dict.items():
-            if k in ("all_photos", "duplicate_clusters_raw"):
+            if k in ("photos", "all_photos", "duplicate_clusters_raw"):
                 continue
             clean_state[k] = v
-        self.set_kv("studio_state", json.dumps(clean_state))
+        self.set_kv("studio_state", json.dumps(clean_state, default=str))
 
     def load_studio_state(self) -> Optional[Dict]:
         """Loads previously saved studio state for instant viewing without re-scanning."""
