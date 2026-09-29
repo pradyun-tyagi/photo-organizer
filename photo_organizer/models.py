@@ -57,6 +57,9 @@ class BurstPhoto:
     score: float
     sharpness: float
     is_best_shot: bool = False
+    is_golden_frame: bool = False
+    eye_openness: float = 0.0
+    motion_blur: float = 0.0
 
 
 @dataclass
@@ -64,6 +67,7 @@ class BurstGroup:
     group_id: str
     photos: List[BurstPhoto]
     best_photo: PhotoInfo
+    golden_frame: Optional[PhotoInfo] = None
 
 
 @dataclass
@@ -79,6 +83,7 @@ class PersonCluster:
 class ActionSummary:
     scanned: int = 0
     duplicates_moved: int = 0
+    burst_duplicates_moved: int = 0
     non_relevant_moved: int = 0
     maybe_non_relevant_moved: int = 0
     organized_moved: int = 0
@@ -112,6 +117,7 @@ class ImageQualityMetrics:
     saturation: float
     noise: float
     text_score: float
+    haze_score: float = 0.0
 
 
 @dataclass
@@ -125,6 +131,9 @@ class EnhancementPlan:
     sharpness_factor: float = 1.0
     autocontrast_cutoff: float = 0.0
     denoise: bool = False
+    dehaze: bool = False
+    dehaze_strength: float = 0.0
+    shadow_chroma_denoise: bool = False
 
 
 @dataclass

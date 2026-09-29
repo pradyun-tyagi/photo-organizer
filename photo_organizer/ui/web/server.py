@@ -86,6 +86,7 @@ class ExecuteRequest(BaseModel):
     skip_enhance: bool = False
     skip_non_relevant: bool = False
     skip_exif_backfill: bool = False
+    auto_curate_bursts: bool = True
     max_size_increase: float = 20.0
     enhancement_mode: str = "balanced"
     workers: int = 0
@@ -360,6 +361,7 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 skip_enhance=req.skip_enhance,
                 skip_non_relevant=req.skip_non_relevant,
                 skip_exif_backfill=req.skip_exif_backfill,
+                auto_curate_bursts=req.auto_curate_bursts,
                 include_videos=req.include_videos,
                 video_folder_name=req.video_folder,
                 max_size_increase_percent=req.max_size_increase,
@@ -1299,11 +1301,11 @@ def get_dashboard_html() -> str:
     <div id="tab-bursts" class="tab-content hidden space-y-4">
       <div class="bg-white rounded-2xl border border-slate-200 p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
         <div>
-          <h3 class="font-bold text-slate-900 text-sm">Burst Shot Detector & Best Shot Selector</h3>
-          <p class="text-xs text-slate-500">Clusters rapid sequences (within 3 seconds) and scores sharpness & exposure</p>
+          <h3 class="font-bold text-slate-900 text-sm">Burst Shot Detector & "Golden Frame" Auto-Picker</h3>
+          <p class="text-xs text-slate-500">Clusters rapid sequences (within 3s), scores sharpness, motion blur, and eye-openness, and crowns the 🏆 Golden Frame. Redundant shots route to duplicates upon organize.</p>
         </div>
         <button onclick="keepBestAllBursts()" class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-xl transition-all shadow-xs flex items-center gap-1.5 shrink-0">
-          ⚡ Auto-Select All Best Shots
+          ⚡ Auto-Select All Golden Frames
         </button>
       </div>
 
@@ -1437,6 +1439,10 @@ def get_dashboard_html() -> str:
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" id="opt-backfill-exif" class="rounded-sm text-indigo-600" checked>
             <span>Backfill missing EXIF timestamps into image headers (Recommended)</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" id="opt-auto-curate-bursts" class="rounded-sm text-indigo-600" checked>
+            <span>Auto-curate burst shots (keep 🏆 Golden Frame, route redundant shots to duplicates)</span>
           </label>
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" id="opt-skip-enhance" class="rounded-sm text-indigo-600">
@@ -2446,25 +2452,29 @@ def get_dashboard_html() -> str:
 
         let photosHtml = '';
         group.photos.forEach(bp => {
-          const isBest = bp.is_best;
-          const cardBorder = isBest ? "border-amber-400 bg-amber-50/40 ring-2 ring-amber-400/30" : "border-slate-200 bg-white";
+          const isGolden = bp.is_golden_frame || bp.is_best || (bp.path === group.golden_frame_path || bp.path === group.best_path);
+          const cardBorder = isGolden ? "border-amber-400 bg-amber-50/40 ring-2 ring-amber-400/30" : "border-slate-200 bg-white";
           photosHtml += `
             <div class="flex-1 min-w-[200px] border rounded-xl p-2.5 ${cardBorder} flex flex-col justify-between space-y-2">
               <div class="relative aspect-square rounded-lg overflow-hidden bg-slate-100 flex items-center justify-center">
                 <img src="/api/image-preview?path=${encodeURIComponent(bp.path)}" loading="lazy" class="object-cover w-full h-full">
-                ${isBest ? `
+                ${isGolden ? `
                   <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500 text-white shadow-xs flex items-center gap-1">
-                    ⭐ BEST SHOT
+                    🏆 GOLDEN FRAME
                   </span>
-                ` : ''}
+                ` : `
+                  <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[10px] font-medium bg-slate-800/80 text-slate-200 shadow-xs flex items-center gap-1">
+                    Redundant Shot
+                  </span>
+                `}
                 <span class="absolute bottom-2 right-2 px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-900/70 text-white">
-                  Sharpness: ${bp.sharpness.toFixed(0)} | Score: ${bp.score.toFixed(1)}
+                  Sharpness: ${bp.sharpness.toFixed(0)} | Score: ${bp.score.toFixed(1)}${bp.motion_blur > 0.3 ? ' | ⚠️ Shake' : ''}${bp.eye_openness < 0.6 && bp.eye_openness > 0 ? ' | 😑 Blink' : ''}
                 </span>
               </div>
               <div class="text-[11px] font-medium text-slate-700 truncate" title="${bp.filename}">${bp.filename}</div>
               <button onclick="keepOnlyBestShot('${group.group_id}', '${encodeURIComponent(bp.path)}')"
-                class="w-full py-1.5 text-xs font-semibold rounded-lg transition-colors ${isBest ? 'bg-amber-100 text-amber-900 hover:bg-amber-200' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}">
-                ${isBest ? 'Keep Best & Move Rest to Delete' : 'Set as Best & Keep'}
+                class="w-full py-1.5 text-xs font-semibold rounded-lg transition-colors ${isGolden ? 'bg-amber-100 text-amber-900 font-bold border border-amber-300' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}">
+                ${isGolden ? '🏆 Golden Frame (Kept by Default)' : 'Set as Golden Frame'}
               </button>
             </div>
           `;
@@ -2476,9 +2486,14 @@ def get_dashboard_html() -> str:
               <span class="text-amber-600 font-bold">⚡ Burst #${idx + 1}</span>
               <span>(${group.photos.length} rapid shots within 3 sec)</span>
             </span>
-            <button onclick="keepOnlyBestShot('${group.group_id}', '${encodeURIComponent(group.best_path)}')" class="text-xs font-bold text-amber-700 hover:text-amber-800 bg-amber-50 hover:bg-amber-100 px-2.5 py-1 rounded-lg border border-amber-200 transition-colors">
-              ⚡ Keep Best Shot Only
-            </button>
+            <div class="flex items-center gap-3">
+              <span class="text-[11px] text-slate-500">
+                🏆 1 Golden Frame Kept &bull; ${group.photos.length - 1} Redundant to Duplicates
+              </span>
+              <button onclick="keepOnlyBestShot('${group.group_id}', '${encodeURIComponent(group.golden_frame_path || group.best_path)}')" class="text-xs font-bold text-amber-700 hover:text-amber-800 bg-amber-50 hover:bg-amber-100 px-2.5 py-1 rounded-lg border border-amber-200 transition-colors">
+                ⚡ Keep Golden Frame Only
+              </button>
+            </div>
           </div>
           <div class="flex flex-wrap gap-3">
             ${photosHtml}
@@ -2767,6 +2782,7 @@ def get_dashboard_html() -> str:
 
     async function confirmExecute() {
       const exifCheck = document.getElementById('opt-backfill-exif');
+      const burstCheck = document.getElementById('opt-auto-curate-bursts');
       const payload = {
         dry_run: currentDryRun,
         visual_threshold: parseInt(document.getElementById('opt-threshold').value) || 5,
@@ -2777,6 +2793,7 @@ def get_dashboard_html() -> str:
         skip_enhance: document.getElementById('opt-skip-enhance').checked,
         skip_non_relevant: document.getElementById('opt-skip-non-relevant').checked,
         skip_exif_backfill: exifCheck ? !exifCheck.checked : false,
+        auto_curate_bursts: burstCheck ? burstCheck.checked : true,
         workers: 0
       };
       closeExecuteModal();

@@ -31,6 +31,8 @@ def print_summary(summary: ActionSummary) -> None:
     print("Summary")
     print(f"  scanned: {summary.scanned}")
     print(f"  duplicates moved to to-be-deleted: {summary.duplicates_moved}")
+    if summary.burst_duplicates_moved > 0:
+        print(f"  burst duplicates moved to to-be-deleted: {summary.burst_duplicates_moved}")
     print(f"  non-relevant moved: {summary.non_relevant_moved}")
     print(f"  maybe non-relevant moved: {summary.maybe_non_relevant_moved}")
     print(f"  organized moves: {summary.organized_moved}")
@@ -119,6 +121,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--skip-exif-backfill",
         action="store_true",
         help="Skip writing missing EXIF DateTimeOriginal metadata to image headers.",
+    )
+    parser.add_argument(
+        "--skip-burst-curation",
+        action="store_true",
+        help="Do not auto-curate burst shots (by default, non-golden burst frames are moved to to-be-deleted).",
     )
     parser.add_argument(
         "--visual-threshold",
@@ -252,6 +259,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         video_folder_name=args.video_folder,
         skip_non_relevant=args.skip_non_relevant,
         skip_exif_backfill=args.skip_exif_backfill,
+        auto_curate_bursts=not args.skip_burst_curation,
         include_videos=args.include_videos,
         max_size_increase_percent=args.max_size_increase,
         worker_count=args.workers,

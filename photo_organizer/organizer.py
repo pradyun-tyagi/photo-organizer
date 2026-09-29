@@ -246,6 +246,7 @@ def scan_library(
         {
             "group_id": b.group_id,
             "best_path": str(b.best_photo.path),
+            "golden_frame_path": str((b.golden_frame or b.best_photo).path),
             "photos": [
                 {
                     "path": str(bp.photo.path),
@@ -253,6 +254,9 @@ def scan_library(
                     "score": bp.score,
                     "sharpness": bp.sharpness,
                     "is_best": bp.is_best_shot,
+                    "is_golden_frame": getattr(bp, "is_golden_frame", bp.is_best_shot),
+                    "eye_openness": getattr(bp, "eye_openness", 1.0),
+                    "motion_blur": getattr(bp, "motion_blur", 0.0),
                 }
                 for bp in b.photos
             ],
@@ -373,6 +377,7 @@ def organize(
     video_folder_name: str = DEFAULT_VIDEO_FOLDER,
     skip_non_relevant: bool = False,
     skip_exif_backfill: bool = False,
+    auto_curate_bursts: bool = True,
     include_videos: bool = True,
     max_size_increase_percent: float = DEFAULT_MAX_SIZE_INCREASE,
     worker_count: int = 0,
@@ -449,7 +454,7 @@ def organize(
     summary.scanned = len(photos)
 
     if progress_callback:
-        progress_callback("Analyzing duplicates...", 0.28, {"scanned": summary.scanned})
+        progress_callback("Analyzing duplicates and burst sequences...", 0.28, {"scanned": summary.scanned})
 
     duplicates: Dict[Path, PhotoInfo] = {}
     if custom_keeper_map:
@@ -470,6 +475,38 @@ def organize(
         duplicates = duplicate_paths_to_move(photos, visual_threshold)
 
     duplicate_path_set = set(duplicates)
+    burst_duplicate_paths: set[Path] = set()
+
+    if auto_curate_bursts:
+        burst_groups = detect_burst_groups(photos)
+        for bg in burst_groups:
+            keeper_photo = bg.golden_frame or bg.best_photo
+            if custom_keeper_map:
+                keeper_str = None
+                for bp in bg.photos:
+                    if str(bp.photo.path) in custom_keeper_map:
+                        keeper_str = custom_keeper_map[str(bp.photo.path)]
+                        break
+                if keeper_str == "__KEEP_ALL__":
+                    continue
+                if keeper_str:
+                    matched = next((bp.photo for bp in bg.photos if str(bp.photo.path) == keeper_str), None)
+                    if matched:
+                        keeper_photo = matched
+            else:
+                if keeper_photo.path in duplicate_path_set:
+                    available = [bp.photo for bp in bg.photos if bp.photo.path not in duplicate_path_set]
+                    if available:
+                        keeper_photo = available[0]
+
+            for bp in bg.photos:
+                if bp.photo.path != keeper_photo.path:
+                    duplicate_path_set.add(bp.photo.path)
+                    burst_duplicate_paths.add(bp.photo.path)
+
+            duplicate_path_set.discard(keeper_photo.path)
+            burst_duplicate_paths.discard(keeper_photo.path)
+
     if custom_triage_decisions:
         for p in photos:
             p_str = str(p.path)
@@ -479,6 +516,7 @@ def organize(
                 duplicate_path_set.add(p.path)
             elif dec in ("MAIN", "KEEP"):
                 duplicate_path_set.discard(p.path)
+                burst_duplicate_paths.discard(p.path)
 
     # 1. Move duplicates into to-be-deleted
     for photo in photos:
@@ -497,6 +535,8 @@ def organize(
             )
             if moved:
                 summary.duplicates_moved += 1
+                if photo.path in burst_duplicate_paths:
+                    summary.burst_duplicates_moved += 1
                 summary.companions_moved += companions_moved
                 summary.moved_paths_map[str(photo.path.resolve())] = str(dest_final.resolve())
         except OSError as exc:

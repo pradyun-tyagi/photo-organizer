@@ -50,6 +50,26 @@ from photo_organizer.vision.faces import _get_deep_face_models
 
 
 
+def compute_haze_score_from_prepared(working_rgb: "Image.Image") -> float:
+    """Computes dark channel prior haze metric (0.0 to 1.0)."""
+    if cv2 is None or np is None:
+        return 0.0
+    try:
+        small = working_rgb.copy()
+        small.thumbnail((360, 360), Image.Resampling.BILINEAR)
+        arr = np.array(small)
+        min_ch = np.min(arr, axis=2).astype(np.float32) / 255.0
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        dark = cv2.erode(min_ch, kernel)
+        non_sky_dark = dark[dark < 0.85]
+        if len(non_sky_dark) == 0:
+            return 0.0
+        mean_dark = float(np.mean(non_sky_dark))
+        return round(float(np.clip((mean_dark - 0.10) / 0.18, 0.0, 1.0)), 3)
+    except Exception:
+        return 0.0
+
+
 def image_quality_metrics(image: "Image.Image") -> ImageQualityMetrics:
     working = analysis_image(image, max_dimension=900)
     gray = ImageOps.grayscale(working)
@@ -63,6 +83,7 @@ def image_quality_metrics(image: "Image.Image") -> ImageQualityMetrics:
         saturation=color_saturation_score_from_rgb(working),
         noise=noise_score(gray),
         text_score=text_score,
+        haze_score=compute_haze_score_from_prepared(working),
     )
 
 
@@ -107,6 +128,14 @@ def build_enhancement_plan(metrics: ImageQualityMetrics) -> EnhancementPlan:
     elif metrics.sharpness < 90 and metrics.noise < 10 and metrics.text_score < 0.45:
         plan.sharpness_factor = 1.05
         reasons.append("slightly soft image")
+
+    if metrics.haze_score >= 0.35 and metrics.text_score < 0.45:
+        plan.dehaze = True
+        plan.dehaze_strength = min(0.75, max(0.40, metrics.haze_score * 0.80))
+        reasons.append(f"atmospheric haze (score {metrics.haze_score:.2f})")
+
+    if metrics.brightness < 85 or plan.gamma < 1.0 or plan.brightness_factor > 1.0:
+        plan.shadow_chroma_denoise = True
 
     if not reasons:
         return plan
@@ -390,6 +419,149 @@ def build_facial_landmark_masks(
     return eye_mask, lip_mask
 
 
+def compute_dark_channel(bgr_f: "np.ndarray", patch_size: int = 11) -> "np.ndarray":
+    """Computes dark channel prior min_c(I^c) over local patch."""
+    min_ch = np.min(bgr_f, axis=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (patch_size, patch_size))
+    return cv2.erode(min_ch, kernel)
+
+
+def estimate_atmospheric_light(
+    bgr_f: "np.ndarray", dark_channel: "np.ndarray", top_percent: float = 0.001
+) -> "np.ndarray":
+    """Estimates atmospheric light vector A by selecting brightest pixel among top dark channel values."""
+    H, W = dark_channel.shape[:2]
+    num_top = max(1, int(H * W * top_percent))
+    dark_flat = dark_channel.reshape(-1)
+    bgr_flat = bgr_f.reshape(-1, 3)
+    indices = np.argpartition(dark_flat, -num_top)[-num_top:]
+    top_pixels = bgr_flat[indices]
+    luminance = np.sum(top_pixels, axis=1)
+    best_idx = np.argmax(luminance)
+    return np.clip(top_pixels[best_idx], 0.15, 0.98)
+
+
+def fast_guided_filter(
+    guide_gray: "np.ndarray", src: "np.ndarray", r: int = 16, eps: float = 1e-3
+) -> "np.ndarray":
+    """Fast, edge-preserving $O(1)$ Guided Filter for halo-free transmission map refinement."""
+    ksize = (2 * r + 1, 2 * r + 1)
+    mean_I = cv2.boxFilter(guide_gray, cv2.CV_32F, ksize)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, ksize)
+    mean_Ip = cv2.boxFilter(guide_gray * src, cv2.CV_32F, ksize)
+    cov_Ip = mean_Ip - mean_I * mean_p
+    mean_II = cv2.boxFilter(guide_gray * guide_gray, cv2.CV_32F, ksize)
+    var_I = mean_II - mean_I * mean_I
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+    return mean_a * guide_gray + mean_b
+
+
+def apply_atmospheric_dehaze(
+    bgr: "np.ndarray",
+    strength: float = 0.65,
+    omega: float = 0.85,
+    t_min: float = 0.25,
+) -> "np.ndarray":
+    """Single Image Dehazing using Dark Channel Prior (DCP) with Guided Filter transmission refinement.
+    Protects sky and background natural beauty with adaptive whiteness transition and transmission floor.
+    """
+    if cv2 is None or np is None or strength <= 0:
+        return bgr
+
+    H, W = bgr.shape[:2]
+    bgr_f = bgr.astype(np.float32) / 255.0
+
+    # 1. Downscale for fast A and initial transmission estimation (< 2ms)
+    max_d = max(H, W)
+    scale = 480.0 / max_d if max_d > 480 else 1.0
+    if scale < 1.0:
+        sw, sh = max(16, int(W * scale)), max(16, int(H * scale))
+        thumb = cv2.resize(bgr_f, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        thumb = bgr_f
+
+    # Compute dark channel of thumb
+    dark_thumb = compute_dark_channel(thumb, patch_size=11)
+    A = estimate_atmospheric_light(thumb, dark_thumb)
+
+    # 2. Estimate transmission map on normalized image: I(x) / A
+    norm_thumb = thumb / A
+    dark_norm = compute_dark_channel(norm_thumb, patch_size=11)
+    t_raw_thumb = 1.0 - (omega * strength) * dark_norm
+
+    # Sky & Highlight Protection:
+    # In sky/cloud areas, norm_thumb is near 1.0. Blend t toward 1.0 to avoid darkening or artifacts.
+    whiteness_thumb = np.min(norm_thumb, axis=2)
+    sky_mask = np.clip((whiteness_thumb - 0.70) / 0.25, 0.0, 1.0)
+    t_raw_thumb = (1.0 - sky_mask) * t_raw_thumb + sky_mask * np.maximum(t_raw_thumb, 0.85)
+    t_raw_thumb = np.clip(t_raw_thumb, t_min, 1.0)
+
+    # 3. Upscale and refine transmission map with Guided Filter at full resolution
+    if scale < 1.0:
+        t_raw = cv2.resize(t_raw_thumb, (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        t_raw = t_raw_thumb
+
+    gray_full = cv2.cvtColor(bgr_f, cv2.COLOR_BGR2GRAY)
+    t_refined = fast_guided_filter(gray_full, t_raw, r=16, eps=1e-3)
+    t_refined = np.clip(t_refined, t_min, 1.0)
+
+    # Expand t to 3 channels
+    t_3ch = cv2.merge([t_refined, t_refined, t_refined])
+
+    # 4. Recover Scene Radiance J(x) = (I(x) - A) / t(x) + A
+    A_3ch = np.array(A, dtype=np.float32).reshape(1, 1, 3)
+    J = (bgr_f - A_3ch) / t_3ch + A_3ch
+
+    # Smooth blending with original image based on strength and sky protection
+    dehazed_bgr = np.clip(J * 255.0, 0, 255).astype(np.uint8)
+    return dehazed_bgr
+
+
+def apply_deep_shadow_chroma_denoising(
+    l_channel: "np.ndarray",
+    a_channel: "np.ndarray",
+    b_channel: "np.ndarray",
+    shadow_cutoff: float = 80.0,
+) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Bilateral chrominance smoothing applied specifically to deep shadow regions.
+    Eliminates ugly purple/red/green sensor blotches in lifted shadows while preserving 100% luminance sharpness.
+    """
+    if cv2 is None or np is None:
+        return a_channel, b_channel
+
+    H, W = l_channel.shape[:2]
+    # Smooth shadow weight: 1.0 at L=0, tapering to 0.0 at L >= shadow_cutoff
+    l_f = l_channel.astype(np.float32)
+    shadow_weight = np.clip((shadow_cutoff - l_f) / max(10.0, shadow_cutoff * 0.5), 0.0, 1.0)
+
+    # Check if there are significant shadow areas
+    if float(np.max(shadow_weight)) < 0.05:
+        return a_channel, b_channel
+
+    # Gaussian feather shadow mask to avoid edge transitions
+    shadow_weight = cv2.GaussianBlur(shadow_weight, (9, 9), sigmaX=3.0, sigmaY=3.0)
+
+    # Bilateral chrominance filtering on a and b channels
+    # d=7, sigmaColor=25, sigmaSpace=9 cleans mottled color blotches effectively
+    a_clean = cv2.bilateralFilter(a_channel, d=7, sigmaColor=25, sigmaSpace=9)
+    b_clean = cv2.bilateralFilter(b_channel, d=7, sigmaColor=25, sigmaSpace=9)
+
+    # Blend according to shadow weight
+    a_f = a_channel.astype(np.float32)
+    b_f = b_channel.astype(np.float32)
+    a_out = (1.0 - shadow_weight) * a_f + shadow_weight * a_clean.astype(np.float32)
+    b_out = (1.0 - shadow_weight) * b_f + shadow_weight * b_clean.astype(np.float32)
+
+    return (
+        np.clip(np.round(a_out), 0, 255).astype(np.uint8),
+        np.clip(np.round(b_out), 0, 255).astype(np.uint8),
+    )
+
+
 def apply_retinex_illumination_exposure(
     l_channel: "np.ndarray", gamma: float, brightness_factor: float
 ) -> "np.ndarray":
@@ -643,6 +815,10 @@ def apply_enhancement_plan(
             eye_mask = None
             lip_mask = None
 
+        # Atmospheric Dehaze (Dark Channel Prior with Guided Filter & Sky Protection)
+        if plan.dehaze and plan.dehaze_strength > 0:
+            bgr = apply_atmospheric_dehaze(bgr, strength=plan.dehaze_strength)
+
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
@@ -660,6 +836,10 @@ def apply_enhancement_plan(
             l_composite = apply_frequency_separation_portrait(l_bg, face_mask, eye_mask)
         else:
             l_composite = l_bg
+
+        # Deep Shadow Chrominance Denoising: cleans mottled sensor noise in dark/lifted shadows
+        if plan.shadow_chroma_denoise:
+            a, b = apply_deep_shadow_chroma_denoising(l_retinex, a, b)
 
         # 5. Perceptual Adaptive Vibrance (Muted-Pixel Priority & Chlorophyll/Sky Protection)
         # Prevents neon grass or cyan skies; lifts dull/muted tones naturally

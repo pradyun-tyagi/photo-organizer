@@ -1082,6 +1082,172 @@ class AdvancedFeaturesTests(unittest.TestCase):
             self.assertEqual(bf_res.status_code, 200)
             self.assertEqual(bf_res.json()["updated_count"], 1)
 
+    def test_atmospheric_dehaze_dcp(self):
+        import numpy as np
+        import cv2
+        from photo_organizer.vision.enhancer import (
+            apply_atmospheric_dehaze,
+            compute_dark_channel,
+            estimate_atmospheric_light,
+            fast_guided_filter,
+        )
+
+        bgr = np.full((120, 120, 3), 180, dtype=np.uint8)
+        bgr[60:120, 20:60] = [80, 120, 100]
+        bgr[0:40, :] = [245, 240, 235]
+
+        # 1. Dark channel computation
+        dark = compute_dark_channel(bgr / 255.0, patch_size=7)
+        self.assertEqual(dark.shape, (120, 120))
+        self.assertTrue(dark[80, 40] < dark[20, 20])
+
+        # 2. Atmospheric light estimation
+        A = estimate_atmospheric_light(bgr / 255.0, dark)
+        self.assertEqual(len(A), 3)
+        self.assertTrue(all(0.5 <= a_val <= 1.0 for a_val in A))
+
+        # 3. Guided filter edge preservation
+        guide = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) / 255.0
+        refined = fast_guided_filter(guide, dark, r=8, eps=1e-3)
+        self.assertEqual(refined.shape, (120, 120))
+
+        # 4. End-to-end atmospheric dehaze
+        dehazed = apply_atmospheric_dehaze(bgr, strength=0.7)
+        self.assertEqual(dehazed.shape, (120, 120, 3))
+        self.assertGreaterEqual(int(dehazed[10, 10].mean()), 210)
+        self.assertTrue(dehazed.std() >= bgr.std())
+
+    def test_deep_shadow_chroma_denoising(self):
+        import numpy as np
+        from photo_organizer.vision.enhancer import apply_deep_shadow_chroma_denoising
+
+        l = np.full((100, 100), 35, dtype=np.uint8)
+        np.random.seed(42)
+        a_noisy = np.clip(np.random.normal(128, 18, (100, 100)), 0, 255).astype(np.uint8)
+        b_noisy = np.clip(np.random.normal(128, 18, (100, 100)), 0, 255).astype(np.uint8)
+
+        a_clean, b_clean = apply_deep_shadow_chroma_denoising(l, a_noisy, b_noisy, shadow_cutoff=80.0)
+        self.assertEqual(a_clean.shape, (100, 100))
+        self.assertEqual(b_clean.shape, (100, 100))
+        self.assertLess(float(np.var(a_clean)), float(np.var(a_noisy)))
+        self.assertLess(float(np.var(b_clean)), float(np.var(b_noisy)))
+
+        l_bright = np.full((100, 100), 160, dtype=np.uint8)
+        a_kept, b_kept = apply_deep_shadow_chroma_denoising(l_bright, a_noisy, b_noisy, shadow_cutoff=80.0)
+        np.testing.assert_array_equal(a_kept, a_noisy)
+        np.testing.assert_array_equal(b_kept, b_noisy)
+
+    def test_burst_golden_frame_auto_picker_and_organize(self):
+        import numpy as np
+        from PIL import Image, ImageFilter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arr = np.zeros((100, 100, 3), dtype=np.uint8)
+            arr[20:80, 20:80, 0] = 200
+            arr[30:70, 30:70, 1] = 180
+            base = Image.fromarray(arr)
+
+            f1 = root / "IMG_20240101_100000.jpg"
+            base.save(f1, "JPEG", quality=95)
+
+            f2 = root / "IMG_20240101_100001.jpg"
+            base.filter(ImageFilter.BoxBlur(1)).save(f2, "JPEG", quality=92)
+
+            f3 = root / "IMG_20240101_100002.jpg"
+            base.filter(ImageFilter.BoxBlur(2)).save(f3, "JPEG", quality=90)
+
+            # 1. Scan library and verify Golden Frame detection
+            scan_res = scan_library(root, worker_count=1)
+            bursts = scan_res["burst_groups"]
+            self.assertEqual(len(bursts), 1)
+            b = bursts[0]
+            self.assertEqual(len(b["photos"]), 3)
+            self.assertEqual(b["best_path"], str(f1))
+            self.assertEqual(b["golden_frame_path"], str(f1))
+
+            golden_entry = next(p for p in b["photos"] if p["path"] == str(f1))
+            self.assertTrue(golden_entry["is_golden_frame"])
+            self.assertTrue(golden_entry["is_best"])
+
+            # 2. Test organize with auto_curate_bursts=True (Default)
+            summary = organize(
+                root=root,
+                dry_run=False,
+                auto_curate_bursts=True,
+                skip_enhance=True,
+                worker_count=1,
+            )
+            self.assertEqual(summary.burst_duplicates_moved, 2)
+            self.assertEqual(summary.duplicates_moved, 2)
+            self.assertEqual(summary.organized_moved, 1)
+
+            golden_dest = root / "2024" / "2024-01" / "IMG_20240101_100000.jpg"
+            self.assertTrue(golden_dest.exists())
+
+            to_del_f2 = root / "to-be-deleted" / "2024" / "2024-01" / "IMG_20240101_100001.jpg"
+            to_del_f3 = root / "to-be-deleted" / "2024" / "2024-01" / "IMG_20240101_100002.jpg"
+            self.assertTrue(to_del_f2.exists())
+            self.assertTrue(to_del_f3.exists())
+
+    def test_burst_opt_out_preserves_all_frames(self):
+        import numpy as np
+        from PIL import Image, ImageFilter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arr = np.zeros((100, 100, 3), dtype=np.uint8)
+            arr[20:80, 20:80, 0] = 200
+            arr[30:70, 30:70, 1] = 180
+            base = Image.fromarray(arr)
+
+            f1 = root / "IMG_20240101_100000.jpg"
+            base.save(f1, "JPEG", quality=95)
+            f2 = root / "IMG_20240101_100001.jpg"
+            base.filter(ImageFilter.BoxBlur(1)).save(f2, "JPEG", quality=92)
+
+            summary = organize(
+                root=root,
+                dry_run=False,
+                auto_curate_bursts=False,
+                skip_enhance=True,
+                worker_count=1,
+            )
+            self.assertEqual(summary.burst_duplicates_moved, 0)
+            self.assertEqual(summary.duplicates_moved, 0)
+            self.assertEqual(summary.organized_moved, 2)
+            self.assertTrue((root / "2024" / "2024-01" / "IMG_20240101_100000.jpg").exists())
+            self.assertTrue((root / "2024" / "2024-01" / "IMG_20240101_100001.jpg").exists())
+
+    def test_web_api_burst_golden_frame(self):
+        import numpy as np
+        from PIL import Image, ImageFilter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            arr = np.zeros((100, 100, 3), dtype=np.uint8)
+            arr[20:80, 20:80, 0] = 200
+            base = Image.fromarray(arr)
+
+            f1 = root / "IMG_20240101_100000.jpg"
+            base.save(f1, "JPEG", quality=95)
+            f2 = root / "IMG_20240101_100001.jpg"
+            base.filter(ImageFilter.BoxBlur(1)).save(f2, "JPEG", quality=90)
+
+            app = create_app(root)
+            client = TestClient(app)
+
+            s_res = client.post("/api/scan")
+            self.assertEqual(s_res.status_code, 200)
+
+            b_res = client.get("/api/bursts")
+            self.assertEqual(b_res.status_code, 200)
+            b_data = b_res.json()
+            self.assertEqual(len(b_data["burst_groups"]), 1)
+            group = b_data["burst_groups"][0]
+            self.assertEqual(group["golden_frame_path"], str(f1))
+            self.assertTrue(group["photos"][0]["is_golden_frame"])
+
 
 if __name__ == "__main__":
     unittest.main()
