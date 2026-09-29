@@ -24,6 +24,7 @@ from photo_organizer.core.exif_writer import backfill_library_exif_dates
 from photo_organizer.core.journal import Journal
 from photo_organizer.core.raw_heif import extract_raw_preview, get_live_photo_video_path, is_raw_file
 from photo_organizer.organizer import get_default_workers, organize, scan_library
+from photo_organizer.vision.enhancer import apply_enhancement_plan, enhancement_plan_for_image
 from photo_organizer.vision.semantic import search_photos
 
 
@@ -39,6 +40,13 @@ class SelectKeeperRequest(BaseModel):
 class TriageDecisionRequest(BaseModel):
     path: str
     decision: str  # 'KEEP', 'DISCARD', 'RESET'
+
+
+class EnhancementDecisionRequest(BaseModel):
+    path: Optional[str] = None
+    decision: Optional[str] = None  # 'ENHANCE' or 'ORIGINAL'
+    action: Optional[str] = None    # 'ENHANCE_ALL' or 'KEEP_ALL_ORIGINAL'
+
 
 
 class BurstKeepBestRequest(BaseModel):
@@ -88,8 +96,10 @@ class AppState:
         self.scan_data: Optional[Dict[str, Any]] = None
         self.custom_keeper_map: Dict[str, str] = {}
         self.custom_triage_decisions: Dict[str, str] = {}
+        self.custom_enhancement_decisions: Dict[str, str] = {}
         self.custom_people_names: Dict[str, str] = {}
         self.last_summary: Optional[Dict[str, Any]] = None
+
 
 
 def create_app(default_root: Optional[Path] = None) -> FastAPI:
@@ -212,7 +222,9 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
 
         state.custom_keeper_map.clear()
         state.custom_triage_decisions.clear()
+        state.custom_enhancement_decisions.clear()
         background_tasks.add_task(_run_scan_task, state.root_dir, req)
+
         return {"status": "scanning_started"}
 
     @app.get("/api/duplicates")
@@ -279,6 +291,46 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
             state.custom_triage_decisions[resolved] = dec
         return {"status": "ok", "decision": dec}
 
+    @app.get("/api/enhancements")
+    def get_enhancements():
+        if not state.scan_data:
+            return {"total": 0, "candidates": []}
+
+        candidates = [dict(c) for c in state.scan_data.get("enhancement_candidates", [])]
+        for c in candidates:
+            p = c["path"]
+            resolved_p = str(Path(p).resolve())
+            c["decision"] = state.custom_enhancement_decisions.get(
+                p, state.custom_enhancement_decisions.get(resolved_p, "ENHANCE")
+            )
+
+        return {"total": len(candidates), "candidates": candidates}
+
+    @app.post("/api/enhancements/decide")
+    def decide_enhancement(req: EnhancementDecisionRequest):
+        if req.action == "ENHANCE_ALL":
+            if state.scan_data:
+                for c in state.scan_data.get("enhancement_candidates", []):
+                    p = c["path"]
+                    state.custom_enhancement_decisions[p] = "ENHANCE"
+                    state.custom_enhancement_decisions[str(Path(p).resolve())] = "ENHANCE"
+            return {"status": "ok", "action": "ENHANCE_ALL"}
+        elif req.action == "KEEP_ALL_ORIGINAL":
+            if state.scan_data:
+                for c in state.scan_data.get("enhancement_candidates", []):
+                    p = c["path"]
+                    state.custom_enhancement_decisions[p] = "ORIGINAL"
+                    state.custom_enhancement_decisions[str(Path(p).resolve())] = "ORIGINAL"
+            return {"status": "ok", "action": "KEEP_ALL_ORIGINAL"}
+
+        if not req.path or not req.decision:
+            raise HTTPException(status_code=400, detail="Missing path or decision")
+
+        dec = "ORIGINAL" if req.decision.upper() == "ORIGINAL" else "ENHANCE"
+        state.custom_enhancement_decisions[req.path] = dec
+        state.custom_enhancement_decisions[str(Path(req.path).resolve())] = dec
+        return {"status": "ok", "decision": dec}
+
     def _run_organize_task(req: ExecuteRequest):
         def _on_progress(stage: str, percent: float, details: dict):
             state.scan_progress = {"stage": stage, "percent": round(percent * 100, 1), "details": details}
@@ -303,7 +355,9 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 progress_callback=_on_progress,
                 custom_keeper_map=state.custom_keeper_map,
                 custom_triage_decisions=state.custom_triage_decisions,
+                custom_enhancement_decisions=state.custom_enhancement_decisions,
             )
+
             state.last_summary = summary.__dict__
             
             # Maintain and update People, Flashbacks, and Map data with new file paths
@@ -407,7 +461,41 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 headers={"Cache-Control": "public, max-age=86400, immutable"},
             )
 
+    @app.get("/api/enhanced-preview")
+    def enhanced_preview(path: str = Query(...)):
+        file_path = Path(path).resolve()
+        if not file_path.exists() or not is_image_file(file_path):
+            raise HTTPException(status_code=404, detail="Image not found")
+
+        if state.root_dir and not is_inside(file_path, state.root_dir):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        if Image is None:
+            return Response(content=file_path.read_bytes(), media_type="image/jpeg")
+
+        try:
+            with Image.open(file_path) as raw_img:
+                img = ImageOps.exif_transpose(raw_img).convert("RGB")
+                plan = enhancement_plan_for_image(img)
+                if not plan.should_enhance:
+                    enhanced = img
+                else:
+                    enhanced = apply_enhancement_plan(img, plan, enhancement_mode="balanced")
+
+                thumb = enhanced.convert("RGB")
+                thumb.thumbnail((480, 480), Image.Resampling.BILINEAR)
+                buf = io.BytesIO()
+                thumb.save(buf, format="JPEG", quality=80)
+                return Response(
+                    content=buf.getvalue(),
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"},
+                )
+        except Exception:
+            return image_preview(path)
+
     @app.get("/api/search")
+
     def search_library(q: str = Query("")):
         if not state.scan_data or "photos" not in state.scan_data:
             return {"query": q, "count": 0, "results": []}
@@ -718,7 +806,12 @@ def get_dashboard_html() -> str:
         <span>⚡ Burst Shots</span>
         <span id="count-bursts" class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
       </button>
+      <button onclick="switchTab('tab-enhancements')" id="nav-enhancements" class="tab-btn py-3 px-2 border-b-2 font-semibold text-sm border-transparent text-slate-500 hover:text-slate-700 flex items-center gap-1.5">
+        <span>🪄 Enhancements</span>
+        <span id="count-enhancements" class="bg-indigo-100 text-indigo-700 text-xs px-2 py-0.5 rounded-full font-mono font-bold">0</span>
+      </button>
     </div>
+
 
     <!-- SUB-NAVIGATION 2: Explore & View Tabs (Query & Browsing) -->
     <div id="nav-group-explore" class="hidden border-b border-slate-200 flex flex-wrap gap-y-2 space-x-1 sm:space-x-3">
@@ -1080,8 +1173,45 @@ def get_dashboard_html() -> str:
       <div id="bursts-list" class="space-y-4"></div>
     </div>
 
+    <!-- TAB: Photo Enhancements Review -->
+    <div id="tab-enhancements" class="tab-content hidden space-y-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-slate-200">
+        <div>
+          <h2 class="text-base font-bold text-slate-800 flex items-center gap-2">
+            <span>🪄 Adaptive Photo Enhancement Review</span>
+            <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-medium border border-emerald-200">🛡️ Face-Aware & Identity Protected</span>
+          </h2>
+          <p class="text-xs text-slate-500 mt-0.5">
+            Compare original photos side-by-side with neural face-aware enhanced versions. Choose whether to apply enhancements or keep originals untouched.
+          </p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="batchEnhancementDecision('ENHANCE_ALL')" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors">
+            🪄 Enhance All
+          </button>
+          <button onclick="batchEnhancementDecision('KEEP_ALL_ORIGINAL')" class="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold border border-slate-300 transition-colors">
+            📷 Keep All Original
+          </button>
+        </div>
+      </div>
+
+      <div id="enhancements-empty" class="text-center py-16 bg-white rounded-2xl border border-slate-200">
+        <div class="text-4xl mb-3">🪄</div>
+        <h3 class="text-base font-bold text-slate-800">No photos queued for enhancement</h3>
+        <p class="text-sm text-slate-500 mt-1">Photos with low contrast, underexposure, or muted colors will appear here after Scan & Analyze.</p>
+      </div>
+
+      <div id="enhancements-list" class="space-y-4"></div>
+      <div id="enhancements-more-container" class="hidden text-center py-3">
+        <button onclick="renderMoreEnhancements()" class="px-6 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 transition-colors">
+          Load More Enhancement Comparisons (<span id="enhancements-remaining">0</span> remaining)
+        </button>
+      </div>
+    </div>
+
     <!-- TAB 7: People Albums -->
     <div id="tab-people" class="tab-content hidden space-y-4">
+
       <div class="bg-white rounded-2xl border border-slate-200 p-4">
         <h3 class="font-bold text-slate-900 text-sm">People Albums (100% Local Facial Clustering)</h3>
         <p class="text-xs text-slate-500">Fast spatial color & facial feature clustering. Click ✏️ to label names.</p>
@@ -1421,15 +1551,21 @@ def get_dashboard_html() -> str:
       // 6. Flashbacks
       await loadFlashbacks();
 
+      // 7. Enhancements
+      await loadEnhancements();
+
       // If requested (e.g. after fresh initial scan), switch to duplicates or triage tab
       if (autoSwitchTab) {
         if (allClusters.length > 0) {
           switchTab('tab-duplicates');
         } else if (allTriage.length > 0) {
           switchTab('tab-triage');
+        } else if (allEnhancements.length > 0) {
+          switchTab('tab-enhancements');
         }
       }
     }
+
 
     function isVideoExtension(filePath) {
       return /\\.(mp4|mov|m4v|avi|mkv)$/i.test(filePath);
@@ -1711,6 +1847,153 @@ def get_dashboard_html() -> str:
       }
     }
 
+    let allEnhancements = [];
+    let displayedEnhancementsCount = 0;
+
+    async function loadEnhancements() {
+      try {
+        const enhRes = await fetch('/api/enhancements');
+        const enhData = await enhRes.json();
+        allEnhancements = enhData.candidates || [];
+        displayedEnhancementsCount = 0;
+        const countSpan = document.getElementById('count-enhancements');
+        if (countSpan) countSpan.textContent = allEnhancements.length;
+        const container = document.getElementById('enhancements-list');
+        if (container) container.innerHTML = '';
+        renderMoreEnhancements();
+      } catch (e) {
+        console.error("Failed to load enhancements:", e);
+      }
+    }
+
+    function renderMoreEnhancements() {
+      const emptyState = document.getElementById('enhancements-empty');
+      const container = document.getElementById('enhancements-list');
+      const moreContainer = document.getElementById('enhancements-more-container');
+      const remainingSpan = document.getElementById('enhancements-remaining');
+
+      if (!container) return;
+
+      if (allEnhancements.length === 0) {
+        if (emptyState) emptyState.classList.remove('hidden');
+        if (moreContainer) moreContainer.classList.add('hidden');
+        return;
+      }
+      if (emptyState) emptyState.classList.add('hidden');
+
+      const nextBatch = allEnhancements.slice(displayedEnhancementsCount, displayedEnhancementsCount + PAGE_SIZE);
+      displayedEnhancementsCount += nextBatch.length;
+
+      nextBatch.forEach((item) => {
+        const card = document.createElement('div');
+        card.setAttribute('data-enhance-path', encodeURIComponent(item.path));
+        renderEnhancementCardContent(card, item);
+        container.appendChild(card);
+      });
+
+      const remaining = allEnhancements.length - displayedEnhancementsCount;
+      if (remaining > 0 && moreContainer) {
+        moreContainer.classList.remove('hidden');
+        if (remainingSpan) remainingSpan.textContent = remaining;
+      } else if (moreContainer) {
+        moreContainer.classList.add('hidden');
+      }
+    }
+
+    function renderEnhancementCardContent(card, item) {
+      const isOriginal = (item.decision === 'ORIGINAL');
+      card.className = `bg-white rounded-2xl border ${isOriginal ? 'border-amber-300' : 'border-indigo-200'} shadow-xs p-4 space-y-3 transition-colors`;
+      const encodedPath = encodeURIComponent(item.path);
+
+      card.innerHTML = `
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-100 text-xs">
+          <div class="min-w-0">
+            <span class="font-bold text-slate-800 truncate block" title="${item.path}">${item.relative_path}</span>
+            <span class="text-slate-500 text-[11px]">${item.width} × ${item.height} px | ${(item.file_size / 1024).toFixed(1)} KB</span>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0">
+            <span class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">
+              ${item.reason}
+            </span>
+          </div>
+        </div>
+
+        <div class="flex flex-col md:flex-row gap-4">
+          <!-- ORIGINAL SIDE -->
+          <div class="flex-1 border rounded-xl p-3 flex flex-col justify-between space-y-2 transition-all ${isOriginal ? 'border-amber-500 bg-amber-50/30 ring-2 ring-amber-500/20' : 'border-slate-200 bg-white'}">
+            <div class="relative aspect-video rounded-lg overflow-hidden bg-slate-100">
+              <img src="/api/image-preview?path=${encodedPath}" loading="lazy" class="object-cover w-full h-full">
+              <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[11px] font-bold ${isOriginal ? 'bg-amber-600 text-white' : 'bg-slate-700/80 text-white'}">
+                📷 ORIGINAL
+              </span>
+            </div>
+            <button onclick="setEnhancementDecision('${encodedPath}', 'ORIGINAL')"
+              class="w-full py-1.5 text-xs font-semibold rounded-lg transition-colors ${isOriginal ? 'bg-amber-100 text-amber-900 border border-amber-300' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}">
+              ${isOriginal ? '✓ Keeping Original' : 'Keep Original'}
+            </button>
+          </div>
+
+          <!-- ENHANCED SIDE -->
+          <div class="flex-1 border rounded-xl p-3 flex flex-col justify-between space-y-2 transition-all ${!isOriginal ? 'border-emerald-500 bg-emerald-50/20 ring-2 ring-emerald-500/20' : 'border-slate-200 bg-white'}">
+            <div class="relative aspect-video rounded-lg overflow-hidden bg-slate-100">
+              <img src="/api/enhanced-preview?path=${encodedPath}" loading="lazy" class="object-cover w-full h-full">
+              <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[11px] font-bold ${!isOriginal ? 'bg-emerald-600 text-white' : 'bg-slate-700/80 text-white'}">
+                🪄 ENHANCED
+              </span>
+              <span class="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-600/90 text-white">
+                🛡️ SFace Biometric Protected
+              </span>
+            </div>
+            <button onclick="setEnhancementDecision('${encodedPath}', 'ENHANCE')"
+              class="w-full py-1.5 text-xs font-semibold rounded-lg transition-colors ${!isOriginal ? 'bg-emerald-100 text-emerald-900 border border-emerald-300' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}">
+              ${!isOriginal ? '✓ Apply Enhanced' : 'Apply Enhanced'}
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    async function setEnhancementDecision(encodedPath, decision) {
+      const decodedPath = decodeURIComponent(encodedPath);
+      const item = allEnhancements.find(x => x.path === decodedPath);
+      if (item) {
+        item.decision = decision;
+        const card = document.querySelector(`[data-enhance-path="${encodedPath}"]`);
+        if (card) renderEnhancementCardContent(card, item);
+      }
+      try {
+        await fetch('/api/enhancements/decide', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path: decodedPath, decision: decision})
+        });
+      } catch (e) {
+        console.error("Failed to save enhancement decision:", e);
+      }
+    }
+
+    async function batchEnhancementDecision(action) {
+      const decision = (action === 'ENHANCE_ALL') ? 'ENHANCE' : 'ORIGINAL';
+      allEnhancements.forEach(item => {
+        item.decision = decision;
+      });
+      const cards = document.querySelectorAll('#enhancements-list [data-enhance-path]');
+      cards.forEach(card => {
+        const p = decodeURIComponent(card.getAttribute('data-enhance-path'));
+        const item = allEnhancements.find(x => x.path === p);
+        if (item) renderEnhancementCardContent(card, item);
+      });
+      try {
+        await fetch('/api/enhancements/decide', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: action})
+        });
+      } catch (e) {
+        console.error("Failed to save batch enhancement decision:", e);
+      }
+    }
+
     function renderHistory(runs) {
       const container = document.getElementById('history-table');
       container.innerHTML = '';
@@ -1769,7 +2052,7 @@ def get_dashboard_html() -> str:
         btnExplore.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
         navCurate.classList.remove('hidden');
         navExplore.classList.add('hidden');
-        desc.textContent = 'Curation Studio: Resolve duplicates, screen forwards, and execute organization';
+        desc.textContent = 'Curation Studio: Resolve duplicates, screen forwards, review enhancements, and execute organization';
         switchTab(currentCurateTab);
       } else {
         btnExplore.className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all shadow-xs bg-white text-indigo-700 flex items-center gap-2';
@@ -1782,7 +2065,7 @@ def get_dashboard_html() -> str:
     }
 
     function switchTab(tabId) {
-      const curateTabs = ['tab-options', 'tab-duplicates', 'tab-triage', 'tab-bursts'];
+      const curateTabs = ['tab-options', 'tab-duplicates', 'tab-triage', 'tab-bursts', 'tab-enhancements'];
       const exploreTabs = ['tab-people', 'tab-flashbacks', 'tab-map', 'tab-search', 'tab-history'];
 
       if (curateTabs.includes(tabId)) {
@@ -1793,9 +2076,10 @@ def get_dashboard_html() -> str:
           document.getElementById('btn-section-explore').className = 'px-4 sm:px-5 py-2 text-xs sm:text-sm font-bold rounded-lg transition-all text-slate-600 hover:text-slate-900 flex items-center gap-2';
           document.getElementById('nav-group-curate').classList.remove('hidden');
           document.getElementById('nav-group-explore').classList.add('hidden');
-          document.getElementById('section-description').textContent = 'Curation Studio: Resolve duplicates, screen forwards, and execute organization';
+          document.getElementById('section-description').textContent = 'Curation Studio: Resolve duplicates, screen forwards, review enhancements, and execute organization';
         }
-      } else if (exploreTabs.includes(tabId)) {
+      }
+ else if (exploreTabs.includes(tabId)) {
         currentExploreTab = tabId;
         if (currentSection !== 'explore') {
           currentSection = 'explore';

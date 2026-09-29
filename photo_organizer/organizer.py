@@ -36,8 +36,10 @@ from photo_organizer.core.flashbacks import get_flashback_cards
 from photo_organizer.models import ActionSummary, NonRelevantResult, PhotoInfo
 from photo_organizer.vision.bursts import detect_burst_groups
 from photo_organizer.vision.classifier import classify_photo_for_screening
-from photo_organizer.vision.enhancer import enhance_path_for_worker
+from photo_organizer.vision.enhancer import enhance_path_for_worker, enhancement_plan_for_image
 from photo_organizer.vision.faces import cluster_people_albums
+
+
 
 
 def get_default_workers() -> int:
@@ -276,6 +278,38 @@ def scan_library(
     # 5. EXIF backfill candidates
     exif_backfill_count = len([p for p in photos if p.date_source != "exif" and not p.is_video])
 
+    # 6. Adaptive Enhancement candidates for Studio review
+    enhancement_candidates = []
+    candidates_to_check = [p for p in kept_photos if is_image_file(p.path)]
+    if candidates_to_check:
+        def _check_enhance(p: PhotoInfo) -> Optional[Dict]:
+            try:
+                from PIL import Image
+                with Image.open(p.path) as img:
+                    plan = enhancement_plan_for_image(img)
+                    if plan.should_enhance:
+                        return {
+                            "path": str(p.path),
+                            "relative_path": str(p.path.relative_to(root)),
+                            "file_size": p.file_size,
+                            "width": p.width,
+                            "height": p.height,
+                            "reason": plan.reason,
+                            "gamma": plan.gamma,
+                            "brightness_factor": plan.brightness_factor,
+                            "contrast_factor": plan.contrast_factor,
+                        }
+            except Exception:
+                pass
+            return None
+
+        checked = parallel_map(
+            candidates_to_check[:150],
+            worker_count,
+            _check_enhance,
+        )
+        enhancement_candidates = [c for c in checked if c is not None]
+
     if progress_callback:
         progress_callback("Scan completed successfully.", 1.0, {"ready": True})
 
@@ -292,6 +326,7 @@ def scan_library(
         "people_albums": people_albums_data,
         "flashbacks": flashback_cards,
         "exif_backfill_count": exif_backfill_count,
+        "enhancement_candidates": enhancement_candidates,
     }
 
     if cache is not None:
@@ -304,11 +339,13 @@ def scan_library(
                 "geo_photos": geo_photos,
                 "burst_groups": burst_groups_data,
                 "exif_backfill_count": exif_backfill_count,
+                "enhancement_candidates": enhancement_candidates,
             })
         except Exception:
             pass
 
     return scan_result
+
 
 
 def organize(
@@ -330,7 +367,9 @@ def organize(
     progress_callback: Optional[Callable[[str, float, Dict], None]] = None,
     custom_keeper_map: Optional[Dict[str, str]] = None,
     custom_triage_decisions: Optional[Dict[str, str]] = None,
+    custom_enhancement_decisions: Optional[Dict[str, str]] = None,
 ) -> ActionSummary:
+
     root = root.expanduser().resolve()
     to_delete_dir = root / to_delete_folder_name
     non_relevant_dir = root / non_relevant_folder_name
@@ -594,7 +633,15 @@ def organize(
         return summary
 
     images_to_enhance = [p for p in updated_paths if is_image_file(p)]
+    if custom_enhancement_decisions:
+        images_to_enhance = [
+            p
+            for p in images_to_enhance
+            if custom_enhancement_decisions.get(str(p)) != "ORIGINAL"
+            and custom_enhancement_decisions.get(str(p.resolve())) != "ORIGINAL"
+        ]
     total_to_enhance = len(images_to_enhance)
+
     if progress_callback:
         progress_callback(f"Enhancing photos ({total_to_enhance:,} photos)...", 0.75, {})
 

@@ -744,7 +744,121 @@ class AdvancedFeaturesTests(unittest.TestCase):
             decisions3 = {it["path"]: it["user_decision"] for it in items3}
             self.assertEqual(decisions3[str(img2)], "DEFAULT")
 
+    def test_face_aware_feathered_mask_and_biometric_guardrail(self):
+        import numpy as np
+        from photo_organizer.vision.enhancer import (
+            build_feathered_face_mask,
+            verify_and_protect_facial_identity,
+            apply_enhancement_plan,
+        )
+        from photo_organizer.models import EnhancementPlan
+
+        # 1. Test feathered mask generation
+        mask = build_feathered_face_mask((300, 300), [(50, 50, 80, 100)])
+        self.assertEqual(mask.shape, (300, 300))
+        self.assertGreaterEqual(mask.min(), 0.0)
+        self.assertLessEqual(mask.max(), 1.0)
+        # Center should be weighted higher than periphery
+        self.assertGreater(mask[95, 90], 0.8)
+        self.assertEqual(mask[0, 0], 0.0)
+
+        # 2. Test SFace biometric guardrail
+        orig_bgr = np.full((200, 200, 3), 120, dtype=np.uint8)
+        fake_face_row = np.array([30, 30, 80, 80, 50, 50, 90, 50, 70, 70, 55, 90, 85, 90, 0.99], dtype=np.float32)
+
+        # Candidate with slight exposure change should remain safe
+        cand_bgr = np.full((200, 200, 3), 130, dtype=np.uint8)
+        safe_res = verify_and_protect_facial_identity(orig_bgr, cand_bgr, [fake_face_row], min_cosine_similarity=0.98)
+        self.assertEqual(safe_res.shape, (200, 200, 3))
+
+        # Candidate with aggressive pixel distortion should trigger restoration
+        distorted_bgr = cand_bgr.copy()
+        distorted_bgr[25:115, 25:115] = np.random.randint(0, 255, (90, 90, 3), dtype=np.uint8)
+        restored = verify_and_protect_facial_identity(orig_bgr, distorted_bgr, [fake_face_row], min_cosine_similarity=0.98)
+        self.assertEqual(restored.shape, (200, 200, 3))
+        # Center of face should have been pulled back to original pixels (120)
+        self.assertAlmostEqual(float(restored[70, 70, 0]), 120, delta=15)
+
+        # 3. Test apply_enhancement_plan produces valid PIL image
+        test_img = Image.new("RGB", (150, 150), (60, 50, 45))
+        plan = EnhancementPlan(True, "underexposed", gamma=0.88, brightness_factor=1.03, contrast_factor=1.06)
+        enhanced = apply_enhancement_plan(test_img, plan, "balanced")
+        self.assertEqual(enhanced.size, (150, 150))
+
+    def test_enhancement_api_endpoints_and_organize_filtering(self):
+        from photo_organizer.ui.web.server import create_app
+        from photo_organizer.organizer import organize
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Create photos that need enhancement (underexposed)
+            photo1 = root / "photo1.jpg"
+            Image.new("RGB", (200, 200), (50, 45, 40)).save(photo1, "JPEG")
+            photo2 = root / "photo2.jpg"
+            Image.new("RGB", (200, 200), (52, 47, 42)).save(photo2, "JPEG")
+
+            app = create_app(root)
+            client = TestClient(app)
+
+            # Trigger scan
+            s_res = client.post("/api/scan")
+            self.assertEqual(s_res.status_code, 200)
+
+            # Wait for scan completion
+            for _ in range(50):
+                st = client.get("/api/status").json()
+                if not st.get("is_scanning", False):
+                    break
+
+            # 1. Query enhancements
+            e_res = client.get("/api/enhancements")
+            self.assertEqual(e_res.status_code, 200)
+            data = e_res.json()
+            self.assertIn("candidates", data)
+
+            # 2. Test single decide
+            d_res = client.post("/api/enhancements/decide", json={"path": str(photo1), "decision": "ORIGINAL"})
+            self.assertEqual(d_res.status_code, 200)
+            self.assertEqual(d_res.json()["decision"], "ORIGINAL")
+
+            # 3. Test batch decide
+            b_res = client.post("/api/enhancements/decide", json={"action": "ENHANCE_ALL"})
+            self.assertEqual(b_res.status_code, 200)
+
+            # 4. Test enhanced preview endpoint
+            prev_res = client.get(f"/api/enhanced-preview?path={photo1}")
+            self.assertEqual(prev_res.status_code, 200)
+            self.assertEqual(prev_res.headers["content-type"], "image/jpeg")
+            self.assertGreater(len(prev_res.content), 100)
+
+            # 5. Test organize respects custom_enhancement_decisions (skips ORIGINAL)
+            org_root = root / "to_org"
+            org_root.mkdir()
+            p_keep_orig = org_root / "keep_orig.jpg"
+            img1 = Image.new("RGB", (150, 150), (45, 40, 35))
+            img1.putpixel((5, 5), (100, 100, 100))
+            img1.save(p_keep_orig, "JPEG")
+
+            p_enhance = org_root / "do_enhance.jpg"
+            img2 = Image.new("RGB", (150, 150), (48, 42, 38))
+            img2.putpixel((10, 10), (120, 120, 120))
+            img2.save(p_enhance, "JPEG")
+
+            decisions = {str(p_keep_orig.resolve()): "ORIGINAL"}
+            summary = organize(
+                org_root,
+                dry_run=False,
+                skip_enhance=False,
+                skip_non_relevant=True,
+                max_size_increase_percent=20.0,
+                custom_enhancement_decisions=decisions,
+            )
+            # Only do_enhance should be enhanced; keep_orig was excluded by decision!
+            self.assertEqual(summary.enhanced, 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
