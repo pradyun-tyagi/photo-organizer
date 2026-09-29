@@ -660,6 +660,83 @@ class AdvancedFeaturesTests(unittest.TestCase):
             face_module.extract_face_crops_and_features = orig_extract
 
 
+    def test_triage_decision_persistence_and_override(self):
+        """Verifies triage decision overrides: KEEP saves to library, DISCARD moves to junk."""
+        from photo_organizer.ui.web.server import create_app
+        from fastapi.testclient import TestClient
+        from photo_organizer.organizer import organize
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            img1 = root / "meme_20240101.jpg"
+            img2 = root / "meme2_20240101.jpg"
+            # Create synthetic images
+            im = Image.new("RGB", (400, 300), color=(255, 255, 255))
+            im.save(img1)
+            im.save(img2)
+
+            app = create_app(default_root=root)
+            client = TestClient(app)
+            client.post("/api/set-directory", json={"directory": str(root)})
+
+            # Mock scan data with borderline items
+            app.state.app_state.scan_data = {
+                "non_relevant_items": [],
+                "maybe_non_relevant_items": [
+                    {
+                        "path": str(img1),
+                        "relative_path": img1.name,
+                        "text_score": 0.75,
+                        "reason": "borderline text image",
+                        "face_detected": False,
+                        "person_detected": False,
+                        "file_size": 1000,
+                        "width": 400,
+                        "height": 300,
+                    },
+                    {
+                        "path": str(img2),
+                        "relative_path": img2.name,
+                        "text_score": 0.85,
+                        "reason": "borderline text image 2",
+                        "face_detected": False,
+                        "person_detected": False,
+                        "file_size": 1000,
+                        "width": 400,
+                        "height": 300,
+                    },
+                ],
+            }
+
+            # 1. Initially decision is DEFAULT
+            t_res = client.get("/api/triage")
+            self.assertEqual(t_res.status_code, 200)
+            items = t_res.json()["maybe_non_relevant"]
+            self.assertEqual(len(items), 2)
+            self.assertEqual(items[0]["user_decision"], "DEFAULT")
+
+            # 2. Set img1 to KEEP and img2 to DISCARD
+            d1 = client.post("/api/triage/decide", json={"path": str(img1), "decision": "KEEP"})
+            self.assertEqual(d1.status_code, 200)
+            d2 = client.post("/api/triage/decide", json={"path": str(img2), "decision": "DISCARD"})
+            self.assertEqual(d2.status_code, 200)
+
+            # Check triage query returns active decisions
+            t_res2 = client.get("/api/triage")
+            items2 = t_res2.json()["maybe_non_relevant"]
+            decisions = {it["path"]: it["user_decision"] for it in items2}
+            self.assertEqual(decisions[str(img1)], "KEEP")
+            self.assertEqual(decisions[str(img2)], "DISCARD")
+
+            # 3. Test RESET
+            r_res = client.post("/api/triage/decide", json={"path": str(img2), "decision": "RESET"})
+            self.assertEqual(r_res.status_code, 200)
+            t_res3 = client.get("/api/triage")
+            items3 = t_res3.json()["maybe_non_relevant"]
+            decisions3 = {it["path"]: it["user_decision"] for it in items3}
+            self.assertEqual(decisions3[str(img2)], "DEFAULT")
+
+
 if __name__ == "__main__":
     unittest.main()
 

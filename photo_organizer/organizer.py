@@ -418,7 +418,9 @@ def organize(
     duplicate_path_set = set(duplicates)
     if custom_triage_decisions:
         for p in photos:
-            if custom_triage_decisions.get(str(p.path)) == "DELETE":
+            p_str = str(p.path)
+            p_res = str(p.path.resolve())
+            if custom_triage_decisions.get(p_str) == "DELETE" or custom_triage_decisions.get(p_res) == "DELETE":
                 duplicate_path_set.add(p.path)
 
     # 1. Move duplicates into to-be-deleted
@@ -483,8 +485,9 @@ def organize(
             )
             for photo, result in screening_results:
                 path_str = str(photo.path)
-                if custom_triage_decisions and path_str in custom_triage_decisions:
-                    decision = custom_triage_decisions[path_str]
+                resolved_str = str(photo.path.resolve())
+                if custom_triage_decisions:
+                    decision = custom_triage_decisions.get(path_str) or custom_triage_decisions.get(resolved_str)
                     if decision == "KEEP":
                         relevant_photos.append(photo)
                         continue

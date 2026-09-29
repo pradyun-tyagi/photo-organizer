@@ -95,6 +95,7 @@ class AppState:
 def create_app(default_root: Optional[Path] = None) -> FastAPI:
     app = FastAPI(title="Photo Organizer Studio", version="2.0.0")
     state = AppState(default_root)
+    app.state.app_state = state
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -244,16 +245,23 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
         maybe = [dict(item) for item in state.scan_data.get("maybe_non_relevant_items", [])]
 
         for item in nr + maybe:
-            item["user_decision"] = state.custom_triage_decisions.get(item["path"], "DEFAULT")
+            resolved_p = str(Path(item["path"]).resolve())
+            item["user_decision"] = state.custom_triage_decisions.get(
+                item["path"],
+                state.custom_triage_decisions.get(resolved_p, "DEFAULT")
+            )
 
         return {"non_relevant": nr, "maybe_non_relevant": maybe}
 
     @app.post("/api/triage/decide")
     def triage_decide(req: TriageDecisionRequest):
+        resolved = str(Path(req.path).resolve())
         if req.decision == "RESET":
             state.custom_triage_decisions.pop(req.path, None)
+            state.custom_triage_decisions.pop(resolved, None)
         else:
             state.custom_triage_decisions[req.path] = req.decision
+            state.custom_triage_decisions[resolved] = req.decision
         return {"status": "ok", "decision": req.decision}
 
     def _run_organize_task(req: ExecuteRequest):
@@ -927,6 +935,29 @@ def get_dashboard_html() -> str:
 
     <!-- TAB 3: Triage Queue -->
     <div id="tab-triage" class="tab-content hidden space-y-4">
+      <!-- Instruction & Batch Action Banner -->
+      <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center text-xl shrink-0">
+            📑
+          </div>
+          <div>
+            <h3 class="font-bold text-slate-900 text-sm">Smart Content Screening & Triage</h3>
+            <p class="text-xs text-slate-500 mt-0.5">
+              Review flagged memes, WhatsApp forwards, and screenshots. Decisions are staged and applied when you click <strong>Organize Now</strong>.
+            </p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 self-stretch md:self-auto shrink-0">
+          <button onclick="applyAllTriage('KEEP')" class="flex-1 md:flex-none px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-colors shadow-xs">
+            Keep All as Photos
+          </button>
+          <button onclick="applyAllTriage('DISCARD')" class="flex-1 md:flex-none px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 transition-colors shadow-xs">
+            Move All to Junk
+          </button>
+        </div>
+      </div>
+
       <div id="triage-empty" class="text-center py-16 bg-white rounded-2xl border border-slate-200">
         <div class="text-4xl mb-3">📑</div>
         <h3 class="text-base font-bold text-slate-800">No text forwards or memes flagged</h3>
@@ -1302,13 +1333,13 @@ def get_dashboard_html() -> str:
           const sData = await sRes.json();
           if (!sData.is_scanning && !sData.is_organizing) {
             clearInterval(pollInterval);
-            loadScanResults();
+            loadScanResults(true);
           }
         }, 500);
       }
     }
 
-    async function loadScanResults() {
+    async function loadScanResults(autoSwitchTab = false) {
       // 1. Duplicates
       const dupRes = await fetch('/api/duplicates');
       const dupData = await dupRes.json();
@@ -1351,11 +1382,13 @@ def get_dashboard_html() -> str:
       // 6. Flashbacks
       await loadFlashbacks();
 
-      // If results arrived, switch to duplicates tab if clusters exist
-      if (allClusters.length > 0) {
-        switchTab('tab-duplicates');
-      } else if (allTriage.length > 0) {
-        switchTab('tab-triage');
+      // If requested (e.g. after fresh initial scan), switch to duplicates or triage tab
+      if (autoSwitchTab) {
+        if (allClusters.length > 0) {
+          switchTab('tab-duplicates');
+        } else if (allTriage.length > 0) {
+          switchTab('tab-triage');
+        }
       }
     }
 
@@ -1465,7 +1498,79 @@ def get_dashboard_html() -> str:
           keeper_path: decodeURIComponent(keeperPath)
         })
       });
-      loadScanResults();
+      loadScanResults(false);
+    }
+
+    function renderTriageCardContent(card, item) {
+      const isMaybe = item.type === 'Maybe Non-relevant';
+      const tagClass = isMaybe ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800';
+      const decision = item.user_decision || 'DEFAULT';
+
+      let decisionBadge = '';
+      let keepBtnClass = 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold';
+      let keepBtnText = 'Keep as Photo';
+      let junkBtnClass = 'bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold';
+      let junkBtnText = 'Move to Junk';
+
+      if (decision === 'KEEP') {
+        card.className = "bg-emerald-50/40 border-2 border-emerald-400 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
+        keepBtnClass = 'bg-emerald-600 text-white font-bold shadow-xs';
+        keepBtnText = '✓ Kept as Photo';
+        junkBtnClass = 'bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs';
+        junkBtnText = 'Move to Junk';
+        decisionBadge = `
+          <div class="px-2.5 py-1 bg-emerald-100/80 border border-emerald-300 text-emerald-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span class="flex items-center gap-1">✓ <span>Will keep in library (<span class="font-mono">YYYY/YYYY-MM</span>)</span></span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-emerald-700 hover:text-emerald-950 underline text-[10px] ml-2">Reset</button>
+          </div>
+        `;
+      } else if (decision === 'DISCARD') {
+        card.className = "bg-rose-50/40 border-2 border-rose-400 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
+        junkBtnClass = 'bg-rose-600 text-white font-bold shadow-xs';
+        junkBtnText = '✓ Marked as Junk';
+        keepBtnClass = 'bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs';
+        keepBtnText = 'Keep as Photo';
+        decisionBadge = `
+          <div class="px-2.5 py-1 bg-rose-100/80 border border-rose-300 text-rose-900 rounded-lg text-[11px] font-semibold flex items-center justify-between">
+            <span class="flex items-center gap-1">🗑️ <span>Will move to <span class="font-mono">non-relevant/</span></span></span>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'RESET')" class="text-rose-700 hover:text-rose-950 underline text-[10px] ml-2">Reset</button>
+          </div>
+        `;
+      } else {
+        card.className = "bg-white border border-slate-200 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2 transition-all";
+        decisionBadge = `
+          <div class="px-2.5 py-1 bg-slate-50 border border-slate-200 text-slate-500 rounded-lg text-[11px] italic">
+            Default on organize: ${isMaybe ? 'Quarantine to maybe-non-relevant/' : 'Move to non-relevant/ junk'}
+          </div>
+        `;
+      }
+
+      card.innerHTML = `
+        <div class="relative aspect-video rounded-lg overflow-hidden bg-slate-100">
+          <img src="/api/image-preview?path=${encodeURIComponent(item.path)}" loading="lazy" class="object-cover w-full h-full">
+          <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[10px] font-bold ${tagClass}">
+            ${item.type}
+          </span>
+          <span class="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-900/70 text-white">
+            Score: ${Number(item.text_score).toFixed(2)}
+          </span>
+        </div>
+        <div class="text-xs space-y-1">
+          <p class="font-semibold text-slate-800 truncate" title="${item.path}">${item.relative_path}</p>
+          <p class="text-[11px] text-slate-500 leading-tight">${item.reason}</p>
+        </div>
+        <div class="space-y-1.5 pt-1">
+          <div class="flex gap-1.5">
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'KEEP')" class="flex-1 py-1.5 text-xs rounded-lg ${keepBtnClass} transition-colors">
+              ${keepBtnText}
+            </button>
+            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'DISCARD')" class="flex-1 py-1.5 text-xs rounded-lg ${junkBtnClass} transition-colors">
+              ${junkBtnText}
+            </button>
+          </div>
+          ${decisionBadge}
+        </div>
+      `;
     }
 
     function renderMoreTriage() {
@@ -1486,33 +1591,8 @@ def get_dashboard_html() -> str:
 
       nextBatch.forEach(item => {
         const card = document.createElement('div');
-        card.className = "bg-white border border-slate-200 rounded-2xl p-3 shadow-xs flex flex-col justify-between space-y-2";
-        const isMaybe = item.type === 'Maybe Non-relevant';
-        const tagClass = isMaybe ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800';
-
-        card.innerHTML = `
-          <div class="relative aspect-video rounded-lg overflow-hidden bg-slate-100">
-            <img src="/api/image-preview?path=${encodeURIComponent(item.path)}" loading="lazy" class="object-cover w-full h-full">
-            <span class="absolute top-2 left-2 px-2 py-0.5 rounded text-[10px] font-bold ${tagClass}">
-              ${item.type}
-            </span>
-            <span class="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-900/70 text-white">
-              Score: ${item.text_score.toFixed(2)}
-            </span>
-          </div>
-          <div class="text-xs space-y-1">
-            <p class="font-semibold text-slate-800 truncate" title="${item.path}">${item.relative_path}</p>
-            <p class="text-[11px] text-slate-500 leading-tight">${item.reason}</p>
-          </div>
-          <div class="flex gap-1.5 pt-1">
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'KEEP')" class="flex-1 py-1.5 text-xs rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold transition-colors">
-              Keep as Photo
-            </button>
-            <button onclick="decideTriage('${encodeURIComponent(item.path)}', 'DISCARD')" class="flex-1 py-1.5 text-xs rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold transition-colors">
-              Move to Junk
-            </button>
-          </div>
-        `;
+        card.setAttribute('data-path', encodeURIComponent(item.path));
+        renderTriageCardContent(card, item);
         container.appendChild(card);
       });
 
@@ -1525,13 +1605,43 @@ def get_dashboard_html() -> str:
       }
     }
 
-    async function decideTriage(path, decision) {
-      await fetch('/api/triage/decide', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({path: decodeURIComponent(path), decision: decision})
+    async function decideTriage(encodedPath, decision) {
+      const decodedPath = decodeURIComponent(encodedPath);
+      const item = allTriage.find(x => x.path === decodedPath);
+      if (item) {
+        item.user_decision = decision;
+        const cards = document.querySelectorAll(`[data-path="${encodedPath}"]`);
+        cards.forEach(card => renderTriageCardContent(card, item));
+      }
+      try {
+        await fetch('/api/triage/decide', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path: decodedPath, decision: decision})
+        });
+      } catch (e) {
+        console.error("Failed to record triage decision:", e);
+      }
+    }
+
+    async function applyAllTriage(decision) {
+      if (allTriage.length === 0) return;
+      allTriage.forEach(item => {
+        item.user_decision = decision;
       });
-      loadScanResults();
+      const cards = document.querySelectorAll('#triage-list [data-path]');
+      cards.forEach(card => {
+        const p = decodeURIComponent(card.getAttribute('data-path'));
+        const item = allTriage.find(x => x.path === p);
+        if (item) renderTriageCardContent(card, item);
+      });
+      for (const item of allTriage) {
+        fetch('/api/triage/decide', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path: item.path, decision: decision})
+        }).catch(console.error);
+      }
     }
 
     function renderHistory(runs) {
