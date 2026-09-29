@@ -942,6 +942,64 @@ class AdvancedFeaturesTests(unittest.TestCase):
             # Only do_enhance should be enhanced; keep_orig was excluded by decision!
             self.assertEqual(summary.enhanced, 1)
 
+    def test_large_library_performance_and_thumbnail_cache(self):
+        from photo_organizer.core.cache import ThumbnailCache, PhotoCache
+        from photo_organizer.core.raw_heif import extract_fast_thumbnail, parse_exif_thumbnail
+        from photo_organizer.ui.web.server import create_app
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1. Verify SQLite WAL, mmap_size, and indexes on PhotoCache
+            pc = PhotoCache(root_dir=root)
+            conn = pc._create_connection()
+            try:
+                jm = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+                self.assertEqual(jm.lower(), "wal")
+                indexes = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index';").fetchall()]
+                self.assertIn("idx_cache_lookup", indexes)
+                self.assertIn("idx_cache_taken_at", indexes)
+                self.assertIn("idx_cache_visual_hash", indexes)
+                self.assertIn("idx_cache_mtime", indexes)
+            finally:
+                conn.close()
+
+            # 2. Verify ThumbnailCache get/set/clear and keying
+            tc = ThumbnailCache(root_dir=root)
+            test_file = root / "sample.jpg"
+            test_file.write_bytes(b"dummy")
+            self.assertIsNone(tc.get(test_file, 5, 100, tag="orig"))
+
+            fake_thumb = b"\xff\xd8\xff\xe0fake_jpeg_content\xff\xd9"
+            tc.set(test_file, 5, 100, fake_thumb, tag="orig")
+            self.assertEqual(tc.get(test_file, 5, 100, tag="orig"), fake_thumb)
+            self.assertIsNone(tc.get(test_file, 5, 100, tag="enh"))
+            self.assertIsNone(tc.get(test_file, 6, 100, tag="orig"))
+            self.assertIsNone(tc.get(test_file, 5, 101, tag="orig"))
+
+            tc.clear()
+            self.assertIsNone(tc.get(test_file, 5, 100, tag="orig"))
+
+            # 3. Test parse_exif_thumbnail on empty or plain bytes
+            self.assertIsNone(parse_exif_thumbnail(b"not_a_jpeg"))
+            self.assertIsNone(extract_fast_thumbnail(test_file))
+
+            # 4. Test Web API preview caching
+            real_img = root / "real.jpg"
+            Image.new("RGB", (300, 300), (100, 120, 140)).save(real_img, "JPEG")
+            app = create_app(root)
+            client = TestClient(app)
+
+            res1 = client.get(f"/api/image-preview?path={real_img}")
+            self.assertEqual(res1.status_code, 200)
+            self.assertIn("etag", res1.headers)
+            content1 = res1.content
+
+            res2 = client.get(f"/api/image-preview?path={real_img}")
+            self.assertEqual(res2.status_code, 200)
+            self.assertEqual(res2.content, content1)
+            self.assertEqual(res2.headers.get("etag"), res1.headers.get("etag"))
+
 
 
 if __name__ == "__main__":

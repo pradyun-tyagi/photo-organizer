@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -18,11 +19,16 @@ except ImportError:
     Image = None
     ImageOps = None
 
-from photo_organizer.core.cache import PhotoCache
+from photo_organizer.core.cache import PhotoCache, ThumbnailCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_inside
 from photo_organizer.core.exif_writer import backfill_library_exif_dates
 from photo_organizer.core.journal import Journal
-from photo_organizer.core.raw_heif import extract_raw_preview, get_live_photo_video_path, is_raw_file
+from photo_organizer.core.raw_heif import (
+    extract_fast_thumbnail,
+    extract_raw_preview,
+    get_live_photo_video_path,
+    is_raw_file,
+)
 from photo_organizer.organizer import get_default_workers, organize, scan_library
 from photo_organizer.vision.enhancer import apply_enhancement_plan, enhancement_plan_for_image
 from photo_organizer.vision.semantic import search_photos
@@ -434,25 +440,57 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
         if state.root_dir and not is_inside(file_path, state.root_dir):
             raise HTTPException(status_code=403, detail="Access denied")
 
+        try:
+            stat = file_path.stat()
+            file_size = stat.st_size
+            mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))
+        except OSError:
+            raise HTTPException(status_code=404, detail="Could not read file metadata")
+
+        # 1. Check persistent disk cache (sub-millisecond hit)
+        thumb_cache = ThumbnailCache(root_dir=state.root_dir)
+        cached = thumb_cache.get(file_path, file_size, mtime_ns, tag="orig")
+        etag = f'"{hashlib.blake2b(f"{file_path}_{file_size}_{mtime_ns}".encode(), digest_size=8).hexdigest()}"'
+        if cached:
+            return Response(
+                content=cached,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": etag,
+                },
+            )
+
         if Image is None:
             return Response(content=file_path.read_bytes(), media_type="image/jpeg")
 
         try:
-            img = None
-            if is_raw_file(file_path):
-                img = extract_raw_preview(file_path)
-            if img is None:
-                img = Image.open(file_path)
+            # 2. Fast-path: try embedded EXIF thumbnail without decompressing main image
+            thumb_data = extract_fast_thumbnail(file_path)
 
-            thumb = ImageOps.exif_transpose(img).convert("RGB")
-            # 400x400 bilinear thumbnail generation is 3x faster and lightweight
-            thumb.thumbnail((400, 400), Image.Resampling.BILINEAR)
-            buf = io.BytesIO()
-            thumb.save(buf, format="JPEG", quality=75)
+            # 3. Fallback: libjpeg DCT draft scaling during decompression (4x-8x faster than full decode)
+            if thumb_data is None:
+                with Image.open(file_path) as raw_img:
+                    try:
+                        raw_img.draft("RGB", (400, 400))
+                    except Exception:
+                        pass
+                    thumb = ImageOps.exif_transpose(raw_img).convert("RGB")
+                    thumb.thumbnail((400, 400), Image.Resampling.BILINEAR)
+                    buf = io.BytesIO()
+                    thumb.save(buf, format="JPEG", quality=75)
+                    thumb_data = buf.getvalue()
+
+            # 4. Store in persistent disk cache for future instant re-reads
+            thumb_cache.set(file_path, file_size, mtime_ns, thumb_data, tag="orig")
+
             return Response(
-                content=buf.getvalue(),
+                content=thumb_data,
                 media_type="image/jpeg",
-                headers={"Cache-Control": "public, max-age=86400, immutable"},
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": etag,
+                },
             )
         except Exception:
             return Response(
@@ -469,6 +507,27 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
 
         if state.root_dir and not is_inside(file_path, state.root_dir):
             raise HTTPException(status_code=403, detail="Access denied")
+
+        try:
+            stat = file_path.stat()
+            file_size = stat.st_size
+            mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))
+        except OSError:
+            raise HTTPException(status_code=404, detail="Could not read file metadata")
+
+        # 1. Check persistent disk cache for enhanced preview
+        thumb_cache = ThumbnailCache(root_dir=state.root_dir)
+        cached = thumb_cache.get(file_path, file_size, mtime_ns, tag="enh")
+        etag = f'"{hashlib.blake2b(f"{file_path}_{file_size}_{mtime_ns}_enh".encode(), digest_size=8).hexdigest()}"'
+        if cached:
+            return Response(
+                content=cached,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": etag,
+                },
+            )
 
         if Image is None:
             return Response(content=file_path.read_bytes(), media_type="image/jpeg")
@@ -491,11 +550,19 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
                 thumb.thumbnail((480, 480), Image.Resampling.BILINEAR)
                 buf = io.BytesIO()
                 thumb.save(buf, format="JPEG", quality=80)
-                return Response(
-                    content=buf.getvalue(),
-                    media_type="image/jpeg",
-                    headers={"Cache-Control": "public, max-age=3600"},
-                )
+                thumb_data = buf.getvalue()
+
+            # Store in cache
+            thumb_cache.set(file_path, file_size, mtime_ns, thumb_data, tag="enh")
+
+            return Response(
+                content=thumb_data,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                    "ETag": etag,
+                },
+            )
 
         except Exception:
             return image_preview(path)
