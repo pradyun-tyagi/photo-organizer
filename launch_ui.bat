@@ -15,19 +15,28 @@ if exist "%~dp0.venv\Scripts\activate.bat" (
     call "%~dp0.venv\Scripts\activate.bat"
 )
 
-REM Detect Python executable (python, py, or python3)
+REM Detect Python executable (.venv, py -3, py, python, or python3)
 set "PY_CMD="
-python --version >nul 2>&1
-if !errorlevel! equ 0 (
-    set "PY_CMD=python"
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PY_CMD="%~dp0.venv\Scripts\python.exe""
 ) else (
-    py -0 >nul 2>&1
+    py -3 -c "import sys" >nul 2>&1
     if !errorlevel! equ 0 (
-        set "PY_CMD=py"
+        set "PY_CMD=py -3"
     ) else (
-        python3 --version >nul 2>&1
+        py -c "import sys" >nul 2>&1
         if !errorlevel! equ 0 (
-            set "PY_CMD=python3"
+            set "PY_CMD=py"
+        ) else (
+            python -c "import sys" >nul 2>&1
+            if !errorlevel! equ 0 (
+                set "PY_CMD=python"
+            ) else (
+                python3 -c "import sys" >nul 2>&1
+                if !errorlevel! equ 0 (
+                    set "PY_CMD=python3"
+                )
+            )
         )
     )
 )

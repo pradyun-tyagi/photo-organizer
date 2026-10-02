@@ -65,7 +65,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         nargs="?",
         default=None,
         type=str,
-        help="Folder containing pictures (optional with --ui/--undo; supports %PERSONALHOME%).",
+        help="Folder containing pictures (optional with --ui/--undo; supports %%PERSONALHOME%%).",
     )
     parser.add_argument(
         "--ui",
