@@ -14,6 +14,7 @@ from photo_organizer.config import (
     DEFAULT_TO_DELETE_FOLDER,
     DEFAULT_VIDEO_FOLDER,
     DEFAULT_VISUAL_THRESHOLD,
+    expand_personal_path,
 )
 from photo_organizer.core.cache import PhotoCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_video_file
@@ -62,7 +63,7 @@ def scan_library(
     progress_callback: Optional[Callable[[str, float, Dict], None]] = None,
 ) -> Dict:
     """Scans and analyzes a photo library without modifying any files on disk."""
-    root = root.expanduser().resolve()
+    root = expand_personal_path(root) or root.expanduser().resolve()
     to_delete_dir = root / to_delete_folder_name
     non_relevant_dir = root / non_relevant_folder_name
     maybe_non_relevant_dir = root / maybe_non_relevant_folder_name
@@ -390,7 +391,7 @@ def organize(
     custom_enhancement_decisions: Optional[Dict[str, str]] = None,
 ) -> ActionSummary:
 
-    root = root.expanduser().resolve()
+    root = expand_personal_path(root) or root.expanduser().resolve()
     to_delete_dir = root / to_delete_folder_name
     non_relevant_dir = root / non_relevant_folder_name
     maybe_non_relevant_dir = root / maybe_non_relevant_folder_name

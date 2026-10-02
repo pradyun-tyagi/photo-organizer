@@ -110,7 +110,7 @@ python photo_organizer.py --undo /path/to/pictures
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `folder` | Target folder containing photos and videos. | Current Directory |
+| `folder` | Target folder containing photos and videos (supports `%PERSONALHOME%` or relative paths). | Current Directory |
 | `--ui`, `--serve` | Launches the interactive local Web UI Studio. | False |
 | `--undo` | Rolls back the last completed organization run. | False |
 | `--dry-run` | Previews all actions without moving or modifying files. | False |

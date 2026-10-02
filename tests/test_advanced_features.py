@@ -1248,6 +1248,57 @@ class AdvancedFeaturesTests(unittest.TestCase):
             self.assertEqual(group["golden_frame_path"], str(f1))
             self.assertTrue(group["photos"][0]["is_golden_frame"])
 
+    def test_personal_home_path_portability(self):
+        from photo_organizer.config import (
+            expand_personal_path,
+            get_personal_home,
+            serialize_path_portable,
+        )
+
+        personal_base = get_personal_home()
+        # 1. Path strictly under personal folder: must serialize using %PERSONALHOME%
+        photo_in_personal = personal_base / "Pictures" / "2024" / "family.jpg"
+        serialized = serialize_path_portable(photo_in_personal)
+        self.assertTrue(
+            serialized.startswith("%PERSONALHOME%"),
+            f"Expected path under personal folder to start with %PERSONALHOME%, got: {serialized}",
+        )
+        self.assertIn("Pictures/2024/family.jpg", serialized)
+
+        # 2. Expanding serialized %PERSONALHOME% path restores the exact original path
+        expanded = expand_personal_path(serialized)
+        self.assertEqual(expanded, photo_in_personal.resolve())
+
+        # 3. Path outside personal folder (e.g. temporary directory): must NOT use %PERSONALHOME%
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_photo = Path(tmp) / "outside_photo.jpg"
+            non_personal_serialized = serialize_path_portable(tmp_photo)
+            self.assertFalse(
+                non_personal_serialized.startswith("%PERSONALHOME%"),
+                f"Path outside personal folder must not start with %PERSONALHOME%, got: {non_personal_serialized}",
+            )
+            non_personal_expanded = expand_personal_path(non_personal_serialized)
+            self.assertEqual(non_personal_expanded, tmp_photo.resolve())
+
+        # 4. Journal persistence with personal vs non-personal paths
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Journal(root_dir=Path(tmp))
+            run_id = journal.start_run(photo_in_personal.parent, dry_run=False)
+            journal.record_action(
+                run_id=run_id,
+                action_type="MOVE",
+                source_path=str(photo_in_personal),
+                dest_path=str(personal_base / "Archive" / "family.jpg"),
+            )
+            import sqlite3
+            conn = sqlite3.connect(str(journal.db_path))
+            cur = conn.cursor()
+            cur.execute("SELECT source_path, dest_path FROM actions WHERE run_id = ?", (run_id,))
+            row = cur.fetchone()
+            conn.close()
+            self.assertTrue(row[0].startswith("%PERSONALHOME%"))
+            self.assertTrue(row[1].startswith("%PERSONALHOME%"))
+
 
 if __name__ == "__main__":
     unittest.main()

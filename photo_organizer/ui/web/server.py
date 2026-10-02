@@ -20,6 +20,7 @@ except ImportError:
     Image = None
     ImageOps = None
 
+from photo_organizer.config import expand_personal_path
 from photo_organizer.core.cache import PhotoCache, ThumbnailCache
 from photo_organizer.core.discovery import discover_images, is_image_file, is_inside
 from photo_organizer.core.exif_writer import backfill_exif_datetime, backfill_library_exif_dates
@@ -98,7 +99,7 @@ class UndoRequest(BaseModel):
 
 class AppState:
     def __init__(self, initial_root: Optional[Path] = None) -> None:
-        self.root_dir: Optional[Path] = initial_root.resolve() if initial_root else None
+        self.root_dir: Optional[Path] = expand_personal_path(initial_root) if initial_root else None
         self.is_scanning: bool = False
         self.is_organizing: bool = False
         self.scan_progress: Dict[str, Any] = {"stage": "idle", "percent": 0.0, "details": {}}
@@ -144,8 +145,8 @@ def create_app(default_root: Optional[Path] = None) -> FastAPI:
 
     @app.post("/api/set-directory")
     def set_directory(req: SetDirectoryRequest):
-        target = Path(req.directory).expanduser().resolve()
-        if not target.exists() or not target.is_dir():
+        target = expand_personal_path(req.directory)
+        if not target or not target.exists() or not target.is_dir():
             raise HTTPException(status_code=400, detail="Target path is not a valid directory.")
         state.root_dir = target
         state.custom_keeper_map.clear()
@@ -812,7 +813,7 @@ def get_dashboard_html() -> str:
         <div class="flex-1 flex gap-2">
           <div class="relative flex-1">
             <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">📁</span>
-            <input type="text" id="input-dir" placeholder="Enter path to picture directory (e.g. ~/Pictures or D:/Photos)..." 
+            <input type="text" id="input-dir" placeholder="Enter path to picture directory (e.g. %PERSONALHOME%/Pictures, ~/Pictures)..." 
               class="w-full pl-10 pr-3 py-2.5 border border-slate-300 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all font-mono">
           </div>
           <button onclick="setDirectory()" class="px-5 py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-sm font-semibold rounded-xl transition-all shadow-xs shrink-0">

@@ -81,3 +81,46 @@ DEFAULT_VIDEO_FOLDER = "video"
 
 JOURNAL_DB_NAME = ".photo_organizer_journal.db"
 CACHE_DB_NAME = ".photo_cache.sqlite"
+
+import os
+from pathlib import Path
+from typing import Optional
+
+
+def get_personal_home() -> Path:
+    """Returns the base personal directory from PERSONALHOME, defaulting dynamically to Path.home() / 'personal'."""
+    val = os.getenv("PERSONALHOME")
+    if val:
+        return Path(os.path.expandvars(val)).expanduser().resolve()
+    return (Path.home() / "personal").resolve()
+
+
+def expand_personal_path(path_input: str | Path | None) -> Optional[Path]:
+    """Expands environment variables (including %PERSONALHOME% and $PERSONALHOME) and user home (~) dynamically."""
+    if path_input is None:
+        return None
+    if isinstance(path_input, Path):
+        path_str = str(path_input)
+    else:
+        path_str = str(path_input).strip()
+    if not path_str:
+        return None
+
+    expanded = os.path.expandvars(path_str)
+    if "%PERSONALHOME%" in expanded:
+        expanded = expanded.replace("%PERSONALHOME%", str(get_personal_home()))
+    if "$PERSONALHOME" in expanded:
+        expanded = expanded.replace("$PERSONALHOME", str(get_personal_home()))
+    return Path(expanded).expanduser().resolve()
+
+
+def serialize_path_portable(path_input: str | Path) -> str:
+    """Serializes a path relative to %PERSONALHOME% if it resides within PERSONALHOME for portability across machines."""
+    p = Path(path_input).resolve()
+    base = get_personal_home()
+    try:
+        rel = p.relative_to(base)
+        return f"%PERSONALHOME%/{rel.as_posix()}"
+    except ValueError:
+        return str(p)
+

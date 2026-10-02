@@ -15,6 +15,8 @@ from photo_organizer.config import (
     DEFAULT_TO_DELETE_FOLDER,
     DEFAULT_VIDEO_FOLDER,
     DEFAULT_VISUAL_THRESHOLD,
+    expand_personal_path,
+    get_personal_home,
 )
 from photo_organizer.core.journal import Journal
 from photo_organizer.models import ActionSummary
@@ -62,8 +64,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "folder",
         nargs="?",
         default=None,
-        type=Path,
-        help="Folder containing pictures (optional when using --undo or --ui).",
+        type=str,
+        help="Folder containing pictures (optional with --ui/--undo; supports %PERSONALHOME%).",
     )
     parser.add_argument(
         "--ui",
@@ -196,7 +198,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         import uvicorn
         from photo_organizer.ui.web.server import create_app
 
-        root = args.folder.expanduser().resolve() if args.folder else None
+        root = expand_personal_path(args.folder) if args.folder else None
         app = create_app(default_root=root)
         print(f"Starting Photo Organizer Web Studio at http://{args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
@@ -204,7 +206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 2. Handle Undo
     if args.undo:
-        root = args.folder.expanduser().resolve() if args.folder else Path.cwd().resolve()
+        root = expand_personal_path(args.folder) if args.folder else Path.cwd().resolve()
         journal = Journal(root_dir=root)
         restored, failed, errors = journal.undo_run()
         print(f"Undo completed: {restored} files restored, {failed} failed.")
@@ -217,7 +219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("ERROR: folder is required. Run with --help for usage.", file=sys.stderr)
         return 2
 
-    root = args.folder.expanduser()
+    root = expand_personal_path(args.folder)
 
     if not root.exists() or not root.is_dir():
         print(f"ERROR: folder does not exist or is not a directory: {root}", file=sys.stderr)

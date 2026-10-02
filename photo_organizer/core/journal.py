@@ -9,7 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from photo_organizer.config import JOURNAL_DB_NAME
+from photo_organizer.config import (
+    JOURNAL_DB_NAME,
+    expand_personal_path,
+    serialize_path_portable,
+)
 
 
 class Journal:
@@ -65,7 +69,7 @@ class Journal:
                 INSERT INTO runs (run_id, started_at, root_dir, dry_run)
                 VALUES (?, ?, ?, ?)
                 """,
-                (run_id, datetime.now().isoformat(), str(root_dir.resolve()), int(dry_run)),
+                (run_id, datetime.now().isoformat(), serialize_path_portable(root_dir), int(dry_run)),
             )
             conn.commit()
         finally:
@@ -87,7 +91,14 @@ class Journal:
                 INSERT INTO actions (run_id, action_type, source_path, dest_path, timestamp, details)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, action_type, source_path, dest_path, datetime.now().isoformat(), details),
+                (
+                    run_id,
+                    action_type,
+                    serialize_path_portable(source_path),
+                    serialize_path_portable(dest_path),
+                    datetime.now().isoformat(),
+                    details,
+                ),
             )
             conn.commit()
         finally:
@@ -163,8 +174,8 @@ class Journal:
         errors: List[str] = []
 
         for move in moves:
-            current_loc = Path(move["dest_path"])
-            orig_loc = Path(move["source_path"])
+            current_loc = expand_personal_path(move["dest_path"])
+            orig_loc = expand_personal_path(move["source_path"])
 
             if not current_loc.exists():
                 failed += 1

@@ -112,7 +112,7 @@ When you open `http://127.0.0.1:8080`, the interface cleanly separates **Runtime
 ```
 
 ### 3.1 Initial Scan & Folder Selection
-1. Enter the absolute path to your photo library in the top bar (e.g. `C:\path\to\photos` or `/path/to/photos`).
+1. Enter the path to your photo library in the top bar (e.g. `%PERSONALHOME%\Pictures` or `/path/to/photos`).
 2. Click **Set Folder**.
    - If the folder was previously scanned or organized, the Studio **immediately re-hydrates** your People albums, Flashbacks, World Map, and History from the persistent cache without requiring a re-scan!
    - You can jump directly to the **Explore & View** section to browse your collection.
