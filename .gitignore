@@ -19,10 +19,12 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Local configuration & secrets
+# Local configuration, AI agent rules & secrets
 .env
 .env.local
 secrets/
+GEMINI.md
+AGENTS.md
 
 # Distribution
 dist/
